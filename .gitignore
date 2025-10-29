@@ -4,3 +4,10 @@ finetune/checkpoint/*
 __pycache__/
 *.py[cod]
 *$py.class
+logs/
+results/
+wandb/
+finetune/wandb/
+.vscode/
+*.log
+*.out
