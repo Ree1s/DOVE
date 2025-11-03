@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -26,6 +27,10 @@ from diffusers.pipelines.cogvideo.pipeline_output import CogVideoXPipelineOutput
 import pyiqa
 import random
 
+from .cogvideox_transformer3d_router import TokenMergeCogVideoXTransformer3DModel
+
+logger = logging.getLogger(__name__)
+
 class DOVES2Trainer(Trainer):
     UNLOAD_LIST = ["text_encoder", "vae"]
 
@@ -42,9 +47,43 @@ class DOVES2Trainer(Trainer):
             model_path, subfolder="text_encoder"
         )
 
-        components.transformer = CogVideoXTransformer3DModel.from_pretrained(
-            model_path, subfolder="transformer"
-        )
+        base_transformer = CogVideoXTransformer3DModel.from_pretrained(model_path, subfolder="transformer")
+
+        if self.args.enable_token_merge:
+            routes_spec = self.args.token_merge_routes
+            if routes_spec is not None and routes_spec.strip() == "":
+                routes_spec = None
+
+            transformer = TokenMergeCogVideoXTransformer3DModel.from_config(base_transformer.config)
+            missing_keys, unexpected_keys = transformer.load_state_dict(base_transformer.state_dict(), strict=False)
+
+            if unexpected_keys:
+                logger.warning("Unexpected keys when loading token-merge transformer: %s", unexpected_keys)
+            if missing_keys:
+                logger.info("Missing keys when loading token-merge transformer: %s", missing_keys)
+
+            transformer.configure_token_merge(
+                enable_token_merge=True,
+                routes_spec=routes_spec,
+                default_ratio=float(self.args.token_merge_default_ratio),
+                seed=int(self.args.token_merge_seed),
+                restore_adapter_expansion=int(self.args.token_merge_restore_adapter_expansion),
+                window_size=int(self.args.token_merge_window_size),
+                window_stride=int(self.args.token_merge_window_stride),
+            )
+
+            if self.args.token_merge_freeze_routes_only:
+                transformer.freeze_parameters_to_routes()
+
+            if not transformer.enable_token_merge:
+                logger.warning(
+                    "Token merge requested, but no valid routes were configured. Transformer will run without routing."
+                )
+
+            components.transformer = transformer
+            del base_transformer
+        else:
+            components.transformer = base_transformer
 
         components.vae = AutoencoderKLCogVideoX.from_pretrained(model_path, subfolder="vae")
 
