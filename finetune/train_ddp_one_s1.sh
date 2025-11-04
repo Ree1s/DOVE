@@ -18,14 +18,14 @@ MODEL_ARGS=(
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "checkpoint/DOVE-s1"
+    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s1"
     --report_to "wandb"
 )
 
 # Data Configuration
 DATA_ARGS=(
-    --data_root "../datasets/train"
-    --video_column "../datasets/train/HQ-VSR.txt"
+    --data_root "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/HQ-VSR"
+    --video_column "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/HQ-VSR.txt"
     --train_resolution "25x320x640"  # (frames x height x width), frames should be 8N+1
 )
 
@@ -61,7 +61,7 @@ CHECKPOINT_ARGS=(
 # Validation Configuration
 VALIDATION_ARGS=(
     --do_validation true  # ["true", "false"]
-    --validation_dir "../datasets/test/UDM10"
+    --validation_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/UDM10/"
     --validation_steps 500  # should be multiple of checkpointing_steps
     --validation_videos "LQ-Video.txt"
     --validation_ref_videos "GT-Video.txt"

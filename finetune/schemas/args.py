@@ -66,6 +66,10 @@ class Args(BaseModel):
     enable_tiling: bool = True
     nccl_timeout: int = 1800
     stastic_frequency: int = 100
+    use_ema: bool = False
+    ema_decay: float = 0.9999
+    ema_update_after_step: int = 0
+    ema_update_every: int = 1
 
     ########## Lora ##########
     rank: int = 128
@@ -104,6 +108,16 @@ class Args(BaseModel):
     ########## Flow Match ##########
     noise_step: int = 700
     shift_t: float = 1.0
+
+    ########## Token Merge ##########
+    enable_token_merge: bool = False
+    token_merge_routes: str | None = None
+    token_merge_seed: int = 42
+    token_merge_default_ratio: float = 0.0
+    token_merge_restore_adapter_expansion: int = 2
+    token_merge_window_size: int = 0
+    token_merge_window_stride: int = 1
+    token_merge_freeze_routes_only: bool = False
 
     ########## GAN ##########
     diffusion_gan_max_timestep: int = 1000
@@ -163,6 +177,53 @@ class Args(BaseModel):
             #     raise ValueError("validation_steps must be a multiple of checkpointing_steps")
         return v
 
+    @field_validator("token_merge_routes")
+    def validate_token_merge_routes(cls, v: str | None, info: ValidationInfo) -> str | None:
+        """Validate token merge configuration and provide helpful warnings."""
+        values = info.data
+
+        if not values.get("enable_token_merge"):
+            return v
+
+        from finetune.models.dove.token_merge import parse_token_merge_routes
+
+        routes_spec = v
+        if routes_spec is not None and routes_spec.strip() == "":
+            routes_spec = None
+
+        parsed_routes = parse_token_merge_routes(routes_spec) if routes_spec else []
+        default_ratio = values.get("token_merge_default_ratio", 0.0)
+
+        if not parsed_routes and default_ratio <= 0.0:
+            logging.warning(
+                "Token merge enabled but no routes specified and default_ratio=0.0. "
+                "Routing will be a no-op. Specify --token_merge_routes or --token_merge_default_ratio > 0."
+            )
+
+        for route in parsed_routes:
+            ratio = route.get("selection_ratio", 0.0)
+            if ratio > 0.7:
+                logging.warning(
+                    f"Token merge ratio {ratio:.1%} is very aggressive (>70%). "
+                    f"This may significantly impact quality. Consider starting with ratios <0.5."
+                )
+
+        if default_ratio > 0.7:
+            logging.warning(
+                f"Default token merge ratio {default_ratio:.1%} is very aggressive (>70%). "
+                f"This may significantly impact quality. Consider starting with ratios <0.5."
+            )
+
+        return v
+
+    @field_validator("token_merge_window_stride")
+    def validate_token_merge_window(cls, v: int, info: ValidationInfo) -> int:
+        values = info.data
+        window_size = values.get("token_merge_window_size", 0)
+        if window_size > 0 and v <= 0:
+            raise ValueError("token_merge_window_stride must be > 0 when windowing is enabled")
+        return v
+
     @field_validator("train_resolution")
     def validate_train_resolution(cls, v: Tuple[int, int, int], info: ValidationInfo) -> str:
         try:
@@ -214,7 +275,7 @@ class Args(BaseModel):
         parser.add_argument("--caption_column", type=str, default=None)
         parser.add_argument("--video_column", type=str, required=True)
         parser.add_argument("--train_resolution", type=str, required=True)
-        parser.add_argument("--report_to", type=str, required=True)
+        parser.add_argument("--report_to", type=str, default=None)
         parser.add_argument("--crop_mode", type=str, default="random_crop") # for sr
 
         # Training hyperparameters
@@ -231,6 +292,10 @@ class Args(BaseModel):
         parser.add_argument("--epsilon", type=float, default=1e-8)
         parser.add_argument("--weight_decay", type=float, default=1e-4)
         parser.add_argument("--max_grad_norm", type=float, default=1.0)
+        parser.add_argument("--use_ema", action="store_true", help="Enable Exponential Moving Average tracking of transformer parameters")
+        parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay factor (closer to 1 means slower updates)")
+        parser.add_argument("--ema_update_after_step", type=int, default=0, help="Number of steps before EMA starts updating")
+        parser.add_argument("--ema_update_every", type=int, default=1, help="Update EMA weights every N optimizer steps")
 
         # Learning rate scheduler
         parser.add_argument("--lr_scheduler", type=str, default="constant_with_warmup")
@@ -297,6 +362,51 @@ class Args(BaseModel):
         parser.add_argument("--noise_step", type=int, default=700)
         parser.add_argument("--shift_t", type=float, default=1.0)
 
+        # Token merge parameters
+        parser.add_argument("--enable_token_merge", type=lambda x: x.lower() == 'true', default=False)
+        parser.add_argument(
+            "--token_merge_routes",
+            type=str,
+            default=None,
+            help="Semicolon-separated routing specs: 'start-end@ratio;...' e.g. '10-15@0.3;20-25@0.5'",
+        )
+        parser.add_argument(
+            "--token_merge_default_ratio",
+            type=float,
+            default=0.0,
+            help="Default merge ratio applied to all layers when no explicit routes specified",
+        )
+        parser.add_argument(
+            "--token_merge_seed",
+            type=int,
+            default=42,
+            help="Random seed for stochastic token merging",
+        )
+        parser.add_argument(
+            "--token_merge_restore_adapter_expansion",
+            type=int,
+            default=2,
+            help="Expansion factor for RestoreAdapter MLP",
+        )
+        parser.add_argument(
+            "--token_merge_window_size",
+            type=int,
+            default=0,
+            help="Temporal sliding window size for routing (0 disables windowing)",
+        )
+        parser.add_argument(
+            "--token_merge_window_stride",
+            type=int,
+            default=1,
+            help="Stride in frames for sliding routing window progression",
+        )
+        parser.add_argument(
+            "--token_merge_freeze_routes_only",
+            type=lambda x: x.lower() == 'true',
+            default=False,
+            help="Freeze all transformer parameters outside configured token merge routes",
+        )
+
         # GAN parameters
         parser.add_argument("--diffusion_gan_max_timestep", type=int, default=1000)
         parser.add_argument("--gen_cls_loss_weight", type=float, default=5e-3)
@@ -314,5 +424,18 @@ class Args(BaseModel):
         # Convert video_resolution_buckets string to list of tuples
         frames, height, width = args.train_resolution.split("x")
         args.train_resolution = (int(frames), int(height), int(width))
+
+        if args.token_merge_routes is not None:
+            args.token_merge_routes = args.token_merge_routes.strip() or None
+
+        report_to = args.report_to
+        if isinstance(report_to, str):
+            report_to = report_to.lower()
+            if report_to in ("none", "null", ""):
+                args.report_to = None
+            elif report_to not in {"tensorboard", "wandb", "all"}:
+                raise ValueError(
+                    f"Invalid value for --report_to: {args.report_to}. Expected one of ['tensorboard', 'wandb', 'all'] or 'none'."
+                )
 
         return cls(**vars(args))

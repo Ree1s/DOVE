@@ -11,3 +11,4 @@ finetune/wandb/
 .vscode/
 *.log
 *.out
+VideoScore2

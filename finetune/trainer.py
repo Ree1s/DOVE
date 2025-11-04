@@ -26,6 +26,7 @@ from accelerate.utils import (
 )
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines import DiffusionPipeline
+from diffusers.training_utils import EMAModel
 from diffusers.utils.export_utils import export_to_video
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from PIL import Image
@@ -95,6 +96,7 @@ class Trainer:
         self._init_directories()
 
         self.state.using_deepspeed = self.accelerator.state.deepspeed_plugin is not None
+        self.ema_model: EMAModel | None = None
 
     def _init_distributed(self):
         logging_dir = Path(self.args.output_dir, "logs")
@@ -106,7 +108,10 @@ class Trainer:
             backend="nccl", timeout=timedelta(seconds=self.args.nccl_timeout)
         )
         mixed_precision = "no" if torch.backends.mps.is_available() else self.args.mixed_precision
-        report_to = None if self.args.report_to.lower() == "none" else self.args.report_to
+        if isinstance(self.args.report_to, str):
+            report_to = None if self.args.report_to.lower() == "none" else self.args.report_to
+        else:
+            report_to = None
 
         accelerator = Accelerator(
             project_config=project_config,
@@ -323,7 +328,13 @@ class Trainer:
         for attr_name, component in vars(self.components).items():
             if hasattr(component, "requires_grad_"):
                 if self.args.training_type == "sft" and attr_name == "transformer":
-                    component.requires_grad_(True)
+                    if getattr(self.args, "enable_token_merge", False) and getattr(
+                        self.args, "token_merge_freeze_routes_only", False
+                    ):
+                        # keep gradient flags as configured by the model (e.g., token-merge routes only)
+                        pass
+                    else:
+                        component.requires_grad_(True)
                 else:
                     component.requires_grad_(False)
 
@@ -449,6 +460,8 @@ class Trainer:
         self.args.train_epochs = math.ceil(self.args.train_steps / num_update_steps_per_epoch)
         self.state.num_update_steps_per_epoch = num_update_steps_per_epoch
 
+        self._init_ema()
+
     def prepare_for_validation(self):
         validation_videos = load_videos(self.args.validation_dir / self.args.validation_videos)
         if self.args.eval_metric_list != '':
@@ -531,6 +544,8 @@ class Trainer:
         )
         if resume_from_checkpoint_path is not None:
             self.accelerator.load_state(resume_from_checkpoint_path)
+            if getattr(self.args, "use_ema", False):
+                self._load_ema_weights(resume_from_checkpoint_path)
 
         progress_bar = tqdm(
             range(0, self.args.train_steps),
@@ -599,6 +614,7 @@ class Trainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    self._update_ema(global_step)
                     self.__maybe_save_checkpoint(global_step)
 
                 logs.update(loss_dict) 
@@ -637,6 +653,7 @@ class Trainer:
         memory_statistics = get_memory_statistics()
         logger.info(f"Memory after training end: {json.dumps(memory_statistics, indent=4)}")
 
+        self._save_ema_weights(self.args.output_dir)
         accelerator.end_training()
 
     def validate(self, step: int) -> None:
@@ -651,6 +668,15 @@ class Trainer:
 
         self.components.transformer.eval()
         torch.set_grad_enabled(False)
+
+        applying_ema = getattr(self.args, "use_ema", False) and self.ema_model is not None
+        transformer_unwrapped = None
+        ema_params: List[torch.nn.Parameter] | None = None
+        if applying_ema:
+            transformer_unwrapped = unwrap_model(self.accelerator, self.components.transformer)
+            ema_params = self._get_ema_parameter_list(transformer_unwrapped)
+            self.ema_model.store(ema_params)
+            self.ema_model.copy_to(ema_params)
 
         memory_statistics = get_memory_statistics()
         logger.info(f"Memory before validation start: {json.dumps(memory_statistics, indent=4)}")
@@ -842,6 +868,9 @@ class Trainer:
                         step=step,
                     )
 
+        if applying_ema and ema_params is not None:
+            self.ema_model.restore(ema_params)
+
         ##########  Clean up  ##########
         if self.state.using_deepspeed:
             del pipe
@@ -999,6 +1028,76 @@ class Trainer:
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
+    def _init_ema(self) -> None:
+        if not getattr(self.args, "use_ema", False):
+            return
+        if self.ema_model is not None:
+            return
+        if (
+            self.accelerator.distributed_type == DistributedType.DEEPSPEED
+            and self.accelerator.state.deepspeed_plugin is not None
+            and getattr(self.accelerator.state.deepspeed_plugin, "zero_stage", 0) == 3
+        ):
+            logger.warning(
+                "EMA is not supported with DeepSpeed ZeRO-3 in this trainer. Disabling EMA for this run."
+            )
+            self.args.use_ema = False
+            return
+
+        transformer = unwrap_model(self.accelerator, self.components.transformer)
+        parameters = self._get_ema_parameter_list(transformer)
+        if not parameters:
+            logger.warning("EMA requested but no trainable parameters were found. Disabling EMA.")
+            self.args.use_ema = False
+            return
+
+        self.ema_model = EMAModel(parameters, decay=self.args.ema_decay)
+        self.ema_model.to(self.accelerator.device)
+        logger.info(
+            "Initialized EMA tracking (decay=%s, update_after_step=%s, update_every=%s)",
+            self.args.ema_decay,
+            self.args.ema_update_after_step,
+            self.args.ema_update_every,
+        )
+
+    def _update_ema(self, global_step: int) -> None:
+        if not getattr(self.args, "use_ema", False) or self.ema_model is None:
+            return
+        if global_step < self.args.ema_update_after_step:
+            return
+        if (global_step - self.args.ema_update_after_step) % max(self.args.ema_update_every, 1) != 0:
+            return
+
+        transformer = unwrap_model(self.accelerator, self.components.transformer)
+        params = self._get_ema_parameter_list(transformer)
+        self.ema_model.step(params)
+
+    def _save_ema_weights(self, directory: Path | str) -> None:
+        if not getattr(self.args, "use_ema", False) or self.ema_model is None:
+            return
+        if not self.accelerator.is_main_process:
+            return
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        torch.save(self.ema_model.state_dict(), directory / "ema_transformer.pt")
+
+    def _load_ema_weights(self, directory: Path | str) -> None:
+        if not getattr(self.args, "use_ema", False):
+            return
+        ema_path = Path(directory) / "ema_transformer.pt"
+        if not ema_path.exists():
+            logger.warning("EMA weights not found in %s", ema_path)
+            return
+        if self.ema_model is None:
+            self._init_ema()
+        if self.ema_model is None:
+            return
+        state_dict = torch.load(ema_path, map_location=self.accelerator.device)
+        self.ema_model.load_state_dict(state_dict)
+
+    def _get_ema_parameter_list(self, transformer) -> List[torch.nn.Parameter]:
+        return [p for p in transformer.parameters() if p.requires_grad]
+
     def __maybe_save_checkpoint(self, global_step: int, must_save: bool = False):
         if (
             self.accelerator.distributed_type == DistributedType.DEEPSPEED
@@ -1012,6 +1111,7 @@ class Trainer:
                     output_dir=self.args.output_dir,
                 )
                 self.accelerator.save_state(save_path, safe_serialization=True)
+                self._save_ema_weights(save_path)
 
     def save_args_and_state(self):
         output_path = Path(self.args.output_dir)

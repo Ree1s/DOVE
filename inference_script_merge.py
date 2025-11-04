@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import logging
+import time
 
 import torch
 from torchvision import transforms
@@ -53,6 +54,35 @@ def no_grad(func):
         with torch.no_grad():
             return func(*args, **kwargs)
     return wrapper
+
+
+def _load_transformer_state_dict(weights_root: Path) -> Dict[str, torch.Tensor]:
+    transformer_dir = Path(weights_root)
+    if (transformer_dir / "transformer").is_dir():
+        transformer_dir = transformer_dir / "transformer"
+
+    index_file = transformer_dir / "diffusion_pytorch_model.safetensors.index.json"
+    if index_file.exists():
+        with open(index_file, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        shard_cache: Dict[Path, Dict[str, torch.Tensor]] = {}
+        state_dict: Dict[str, torch.Tensor] = {}
+        for weight_name, shard_name in index_data["weight_map"].items():
+            shard_path = transformer_dir / shard_name
+            if shard_path not in shard_cache:
+                shard_cache[shard_path] = load_file(shard_path)
+            state_dict[weight_name] = shard_cache[shard_path][weight_name]
+        return state_dict
+
+    safetensor_file = transformer_dir / "diffusion_pytorch_model.safetensors"
+    if safetensor_file.exists():
+        return load_file(safetensor_file)
+
+    bin_file = transformer_dir / "pytorch_model.bin"
+    if bin_file.exists():
+        return torch.load(bin_file, map_location="cpu")
+
+    raise FileNotFoundError(f"No transformer weights found under {transformer_dir}")
 
 
 def is_video_file(filename):
@@ -487,13 +517,12 @@ def process_video(
     )
 
     # Predict noise
-    predicted_noise = pipe.transformer(
-        hidden_states=latent,
-        encoder_hidden_states=prompt_embedding,
-        timestep=timesteps,
-        image_rotary_emb=rotary_emb,
-        return_dict=False,
-    )[0]
+    predicted_noise = forward_transformer_with_profile(
+        latent,
+        prompt_embedding,
+        timesteps,
+        rotary_emb,
+    )
     
     latent_generate = pipe.scheduler.get_velocity(
         predicted_noise, latent, timesteps
@@ -542,12 +571,15 @@ if __name__ == "__main__":
     parser.add_argument("--sr_noise_step", type=int, default=399)
 
     parser.add_argument("--token_merge_routes", type=str, default=None,
-                        help="Token merge routes, e.g. '10-17@0.36;28-35@0.36'.")
+                    help="Token merge routes, e.g. '10-17@0.36;28-35@0.36'.")
     parser.add_argument("--token_merge_default_ratio", type=float, default=0.0)
     parser.add_argument("--token_merge_seed", type=int, default=42)
     parser.add_argument("--token_merge_restore_adapter_expansion", type=int, default=2)
     parser.add_argument("--token_merge_window_size", type=int, default=0)
     parser.add_argument("--token_merge_window_stride", type=int, default=1)
+
+    parser.add_argument("--profile_transformer", action="store_true",
+                    help="Record latency (and FLOPs for the first call if torch.profiler is available) of transformer forward pass")
 
     parser.add_argument("--is_cpu_offload", action="store_true", help="Enable CPU offload for the model")
 
@@ -587,9 +619,67 @@ if __name__ == "__main__":
         overlap_hw = args.overlap_hw
     else:
         overlap_hw = (0, 0)
-    
+
     # Set seed
     set_seed(args.seed)
+
+    try:
+        import torch.profiler as torch_profiler
+    except (ImportError, ModuleNotFoundError):
+        torch_profiler = None
+
+    profile_state = {
+        "times_ms": [],
+        "flops": None,
+        "profiled": False,
+    }
+
+    def forward_transformer_with_profile(hidden_states, encoder_hidden_states, timestep, image_rotary_emb):
+        if hidden_states.device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        result = None
+        if args.profile_transformer and not profile_state["profiled"] and torch_profiler is not None:
+            try:
+                with torch_profiler.profile(
+                    activities=[
+                        torch_profiler.ProfilerActivity.CPU,
+                        torch_profiler.ProfilerActivity.CUDA
+                        if hidden_states.device.type == "cuda"
+                        else torch_profiler.ProfilerActivity.CPU,
+                    ],
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_flops=True,
+                    with_modules=False,
+                ) as prof:
+                    result = pipe.transformer(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        timestep=timestep,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
+                profile_state["flops"] = prof.key_averages().total_average().flops
+                profile_state["profiled"] = True
+            except Exception as profiling_error:
+                logging.warning("Transformer profiling failed: %s", profiling_error)
+        if result is None:
+            result = pipe.transformer(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                image_rotary_emb=image_rotary_emb,
+                return_dict=False,
+            )[0]
+
+        if hidden_states.device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - start_time) * 1e3
+        if args.profile_transformer:
+            profile_state["times_ms"].append(elapsed_ms)
+        return result
 
     # Load empty prompt embedding if exists
     empty_prompt_embedding = None
@@ -628,12 +718,12 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, subfolder="tokenizer")
     text_encoder = T5EncoderModel.from_pretrained(args.model_path, subfolder="text_encoder")
     vae = AutoencoderKLCogVideoX.from_pretrained(args.model_path, subfolder="vae", torch_dtype=dtype)
-    transformer = TokenMergeCogVideoXTransformer3DModel.from_pretrained(
-        args.model_path,
-        subfolder="transformer",
-        torch_dtype=dtype,
+
+    transformer_config = TokenMergeCogVideoXTransformer3DModel.load_config(
+        args.model_path, subfolder="transformer"
     )
-    state_dict = transformer.state_dict()
+    transformer = TokenMergeCogVideoXTransformer3DModel.from_config(transformer_config)
+    state_dict = _load_transformer_state_dict(Path(args.model_path))
     cfg = transformer.config
     routes_spec = args.token_merge_routes or getattr(cfg, "token_merge_routes", None)
     if routes_spec is None:
@@ -659,6 +749,25 @@ if __name__ == "__main__":
         window_size=args.token_merge_window_size,
         window_stride=args.token_merge_window_stride,
     )
+    load_info = transformer.load_state_dict(state_dict, strict=False)
+    if load_info.missing_keys:
+        logging.warning("Missing token-merge keys when reloading transformer: %s", load_info.missing_keys)
+    if load_info.unexpected_keys:
+        logging.warning("Unexpected token-merge keys when reloading transformer: %s", load_info.unexpected_keys)
+    transformer.to(dtype=dtype)
+    # logging.info(
+    #     "restore_adapter.mlp[0].weight sample (first 5 elems): %s",
+    #     transformer.restore_adapter.mlp[0].weight.flatten()[:5],
+    # )
+    # logging.info(
+    #     "restore_adapter.mlp[2].weight sample (first 5 elems): %s",
+    #     transformer.restore_adapter.mlp[2].weight.flatten()[:5],
+    # )
+    # logging.info(
+    #     "restore_adapter.norm.weight sample (first 5 elems): %s",
+    #     transformer.restore_adapter.norm.weight.flatten()[:5],
+    # )
+
     scheduler = CogVideoXDPMScheduler.from_pretrained(args.model_path, subfolder="scheduler")
 
     pipe = CogVideoXPipeline(
@@ -813,6 +922,18 @@ if __name__ == "__main__":
                 save_video_with_imageio(video_generate, output_path, fps=args.fps, format=args.save_format)
         else:
             print(f"Warning: {video_name} not found in {args.input_dir}")
+
+    if args.profile_transformer and profile_state["times_ms"]:
+        avg_time = sum(profile_state["times_ms"]) / len(profile_state["times_ms"])
+        logging.info(
+            "Transformer forward latency: avg %.2f ms over %d calls (min %.2f ms, max %.2f ms)",
+            avg_time,
+            len(profile_state["times_ms"]),
+            min(profile_state["times_ms"]),
+            max(profile_state["times_ms"]),
+        )
+        if profile_state["flops"] is not None:
+            logging.info("Transformer forward FLOPs (first profiled call): %.3e", profile_state["flops"])
 
     if metrics_models is not None:
         print("\n=== Overall Average Metrics ===")

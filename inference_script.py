@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import logging
+import time
 
 import torch
 from torchvision import transforms
@@ -26,6 +27,7 @@ from pathlib import Path
 import pyiqa
 import imageio.v3 as iio
 import glob
+from contextlib import nullcontext
 
 # Must import after torch because this can sometimes lead to a nasty segmentation fault, or stack smashing error
 # Very few bug reports but it happens. Look in decord Github issues for more relevant information.
@@ -480,13 +482,12 @@ def process_video(
     )
 
     # Predict noise
-    predicted_noise = pipe.transformer(
-        hidden_states=latent,
-        encoder_hidden_states=prompt_embedding,
-        timestep=timesteps,
-        image_rotary_emb=rotary_emb,
-        return_dict=False,
-    )[0]
+    predicted_noise = forward_transformer_with_profile(
+        latent,
+        prompt_embedding,
+        timesteps,
+        rotary_emb,
+    )
     
     latent_generate = pipe.scheduler.get_velocity(
         predicted_noise, latent, timesteps
@@ -534,6 +535,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--sr_noise_step", type=int, default=399)
 
+    parser.add_argument("--profile_transformer", action="store_true",
+                    help="Record latency (and FLOPs for the first call if torch.profiler is available) of transformer forward pass")
+
     parser.add_argument("--is_cpu_offload", action="store_true", help="Enable CPU offload for the model")
 
     parser.add_argument("--is_vae_st", action="store_true", help="Enable VAE slicing and tiling")
@@ -572,9 +576,71 @@ if __name__ == "__main__":
         overlap_hw = args.overlap_hw
     else:
         overlap_hw = (0, 0)
-    
+
     # Set seed
     set_seed(args.seed)
+
+    try:
+        import torch.profiler as torch_profiler
+    except (ImportError, ModuleNotFoundError):
+        torch_profiler = None
+
+    profile_state = {
+        "times_ms": [],
+        "flops": None,
+        "profiled": False,
+    }
+
+    def forward_transformer_with_profile(hidden_states, encoder_hidden_states, timestep, image_rotary_emb):
+        torch.cuda.synchronize() if hidden_states.device.type == "cuda" else None
+        start_time = time.perf_counter()
+
+        if args.profile_transformer and not profile_state["profiled"] and torch_profiler is not None:
+            try:
+                with torch_profiler.profile(
+                    activities=[
+                        torch_profiler.ProfilerActivity.CPU,
+                        torch_profiler.ProfilerActivity.CUDA
+                        if hidden_states.device.type == "cuda"
+                        else torch_profiler.ProfilerActivity.CPU,
+                    ],
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_flops=True,
+                    with_modules=False,
+                ) as prof:
+                    result = pipe.transformer(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        timestep=timestep,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
+                profile_state["flops"] = prof.key_averages().total_average().flops
+                profile_state["profiled"] = True
+            except Exception as profiling_error:
+                logging.warning("Transformer profiling failed: %s", profiling_error)
+                result = pipe.transformer(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    timestep=timestep,
+                    image_rotary_emb=image_rotary_emb,
+                    return_dict=False,
+                )[0]
+        else:
+            result = pipe.transformer(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                image_rotary_emb=image_rotary_emb,
+                return_dict=False,
+            )[0]
+
+        torch.cuda.synchronize() if hidden_states.device.type == "cuda" else None
+        elapsed_ms = (time.perf_counter() - start_time) * 1e3
+        if args.profile_transformer:
+            profile_state["times_ms"].append(elapsed_ms)
+        return result
 
     # Load empty prompt embedding if exists
     empty_prompt_embedding = None
@@ -751,6 +817,18 @@ if __name__ == "__main__":
                 save_video_with_imageio(video_generate, output_path, fps=args.fps, format=args.save_format)
         else:
             print(f"Warning: {video_name} not found in {args.input_dir}")
+
+    if args.profile_transformer and profile_state["times_ms"]:
+        avg_time = sum(profile_state["times_ms"]) / len(profile_state["times_ms"])
+        logging.info(
+            "Transformer forward latency: avg %.2f ms over %d calls (min %.2f ms, max %.2f ms)",
+            avg_time,
+            len(profile_state["times_ms"]),
+            min(profile_state["times_ms"]),
+            max(profile_state["times_ms"]),
+        )
+        if profile_state["flops"] is not None:
+            logging.info("Transformer forward FLOPs (first profiled call): %.3e", profile_state["flops"])
 
     if metrics_models is not None:
         print("\n=== Overall Average Metrics ===")

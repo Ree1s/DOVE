@@ -29,6 +29,7 @@ def bipartite_soft_matching_randframe(
     align_batch: bool = False,
     merge_mode: str = "replace",
     importance_map: Optional[torch.Tensor] = None,
+    target_frame_override: Optional[int] = None,
 ) -> Tuple[Callable[[torch.Tensor], torch.Tensor], Callable[[torch.Tensor], torch.Tensor], Dict[str, object]]:
     """Random frame-based bipartite matching used by ToMe.
 
@@ -79,7 +80,10 @@ def bipartite_soft_matching_randframe(
     src_tokens_batch: List[torch.Tensor] = []
 
     if align_batch:
-        target_frame_common = torch.randint(0, num_frames, (1,), generator=generator, device=device).item()
+        if target_frame_override is not None:
+            target_frame_common = target_frame_override % num_frames
+        else:
+            target_frame_common = torch.randint(0, num_frames, (1,), generator=generator, device=device).item()
 
         if importance_map is not None:
             start_idx_common = frame_start_list[target_frame_common]
@@ -121,7 +125,10 @@ def bipartite_soft_matching_randframe(
             target_frame = target_frame_common
             dst_indices_in_frame = dst_indices_common
         else:
-            target_frame = torch.randint(0, num_frames, (1,), generator=generator, device=device).item()
+            if target_frame_override is not None:
+                target_frame = target_frame_override % num_frames
+            else:
+                target_frame = torch.randint(0, num_frames, (1,), generator=generator, device=device).item()
 
             if importance_map is not None:
                 start_idx = frame_start_list[target_frame]
@@ -287,8 +294,11 @@ class RouteInfo:
 class Router:
     """Router that orchestrates token masking, ToMe merging and restoration."""
 
-    def __init__(self, seed: int = 42) -> None:
+    def __init__(self, seed: int = 42, window_size: int = 0, window_stride: int = 1) -> None:
         self.seed = seed
+        self.window_size = max(0, int(window_size))
+        self.window_stride = max(1, int(window_stride)) if self.window_size > 0 else 1
+        self.next_window_start = 0
 
     def get_mask(
         self,
@@ -318,6 +328,11 @@ class Router:
 
         return {"mask": mask, "ids_keep": ids_keep, "ids_shuffle": ids_shuffle}
 
+    def set_window_params(self, window_size: int, window_stride: int) -> None:
+        self.window_size = max(0, int(window_size))
+        self.window_stride = max(1, int(window_stride)) if self.window_size > 0 else 1
+        self.next_window_start = 0
+
     def tome_merge_and_route(
         self,
         tokens: torch.Tensor,
@@ -333,9 +348,20 @@ class Router:
 
         generator = torch.Generator(device=tokens.device)
         generator.manual_seed(self.seed)
-        prob = torch.rand((), generator=generator, device=tokens.device).item()
+        target_frame_override: Optional[int] = None
+        window_size = min(self.window_size, num_frames) if num_frames > 0 else 0
+        if window_size > 0 and num_frames > 0 and image_tokens.shape[1] % num_frames == 0:
+            window_start = self.next_window_start % num_frames
+            window_frames = [(window_start + i) % num_frames for i in range(window_size)]
+            tokens_per_frame = image_tokens.shape[1] // num_frames
+            if importance_map is not None and tokens_per_frame > 0:
+                frame_scores = importance_map.reshape(tokens.shape[0], num_frames, tokens_per_frame).mean(dim=(0, 2))
+                window_scores = frame_scores[window_frames]
+                target_frame_override = window_frames[torch.argmin(window_scores).item()]
+            else:
+                target_frame_override = window_frames[0]
+            self.next_window_start = (self.next_window_start + self.window_stride) % max(num_frames, 1)
 
-        # if prob < 0.8:
         merge_fn, _, info = bipartite_soft_matching_randframe(
             image_tokens,
             num_frames,
@@ -344,6 +370,7 @@ class Router:
             generator,
             align_batch=True,
             importance_map=importance_map,
+            target_frame_override=target_frame_override,
         )
         # else:
         #     remove = int(image_tokens.shape[1] * selection_ratio)

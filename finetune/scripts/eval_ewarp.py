@@ -4,6 +4,9 @@ import numpy as np
 import sys
 script_path = os.path.abspath(sys.argv[0])
 script_directory = os.path.dirname(script_path)
+repo_root = os.path.abspath(os.path.join(script_directory, "..", ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 os.chdir(script_directory)
 import cv2
 import json
@@ -16,8 +19,16 @@ import shutil
 import subprocess
 import re
 import imageio.v3 as iio
-sys.path.append(os.path.join(os.getcwd(), "RAFT"))
-sys.path.append(os.path.join(os.getcwd(), "RAFT/core"))
+from argparse import Namespace
+
+raft_parent = os.path.abspath(os.path.join(script_directory, "..", "utils"))
+if raft_parent not in sys.path:
+    sys.path.append(raft_parent)
+
+from RAFT.raft import RAFT  # noqa: E402
+from RAFT.utils.utils import InputPadder  # noqa: E402
+from finetune.utils.optical_flow_utils import flow_warp, fbConsistencyCheck  # noqa: E402
+
 
 # 0 ~ 1
 to_tensor = transforms.ToTensor()
@@ -83,8 +94,80 @@ def img2video(subfolder_path, output_path, fps=8):
     )
     print(f"Video saved to {output_path}")
 
+class EwarpCalculator:
+    def __init__(self, model_path, device, small=False, mixed_precision=False, alternate_corr=False, iters=20):
+        self.device = device
+        self.iters = iters
+        raft_args = Namespace(
+            small=small,
+            mixed_precision=mixed_precision,
+            alternate_corr=alternate_corr,
+            dropout=0.0,
+        )
+        self.model = RAFT(raft_args)
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"RAFT checkpoint not found at {model_path}")
+        state = torch.load(model_path, map_location=device)
+        if "state_dict" in state:
+            state = state["state_dict"]
+        cleaned = {k.replace("module.", ""): v for k, v in state.items()}
+        load_res = self.model.load_state_dict(cleaned, strict=False)
+        missing, unexpected = load_res.missing_keys, load_res.unexpected_keys
+        if missing:
+            print(f"Warning: missing RAFT keys: {missing}")
+        if unexpected:
+            print(f"Warning: unexpected RAFT keys: {unexpected}")
+        self.model.to(device)
+        self.model.eval()
+
+    def warp_once(self, src, tgt, flow_src_tgt, flow_tgt_src):
+        mask = fbConsistencyCheck(flow_src_tgt, flow_tgt_src)
+        warped = flow_warp(src, flow_src_tgt.permute(0, 2, 3, 1))
+        diff = ((warped - tgt) / 255.0) ** 2
+        diff_mean = diff.mean(dim=1, keepdim=True)
+        denom = mask.sum()
+        if denom <= 0:
+            return None
+        error = (diff_mean * mask).sum() / denom
+        return float(error.item())
+
+    def warp_error(self, frame_a, frame_b):
+        if frame_a.size(-1) < 2 or frame_a.size(-2) < 2:
+            return None
+        image1 = frame_a.unsqueeze(0)
+        image2 = frame_b.unsqueeze(0)
+        padder = InputPadder(image1.shape)
+        image1_pad, image2_pad = padder.pad(image1, image2)
+        with torch.no_grad():
+            _, flow12 = self.model(image1_pad, image2_pad, iters=self.iters, test_mode=True)
+            _, flow21 = self.model(image2_pad, image1_pad, iters=self.iters, test_mode=True)
+        flow12 = padder.unpad(flow12)
+        flow21 = padder.unpad(flow21)
+        err_fwd = self.warp_once(image1, image2, flow12, flow21)
+        err_bwd = self.warp_once(image2, image1, flow21, flow12)
+        valid_errors = [e for e in (err_fwd, err_bwd) if e is not None]
+        if not valid_errors:
+            return None
+        return float(sum(valid_errors) / len(valid_errors))
+
+    def __call__(self, video_path):
+        frames = read_video_frames(video_path).to(self.device) * 255.0
+        if frames.size(0) < 2:
+            return None
+        errors = []
+        for idx in range(frames.size(0) - 1):
+            err = self.warp_error(frames[idx], frames[idx + 1])
+            if err is not None:
+                errors.append(err)
+        if not errors:
+            return None
+        return float(np.mean(errors))
+
+
 def process(pred_root, out_path, args):
 
+    pred_root = os.path.abspath(pred_root)
+    out_path = os.path.abspath(out_path)
     all_items = os.listdir(pred_root)
     folders_count = 0
     videos_count = 0
@@ -121,7 +204,7 @@ def process(pred_root, out_path, args):
     
     input_path = pred_root  
     if is_folder_dominant:
-        input_path = os.path.join(out_path, "temp")
+        input_path = os.path.abspath(os.path.join(out_path, "temp"))
         os.makedirs(input_path, exist_ok=True)
         
         for name in pred_names:
@@ -131,7 +214,7 @@ def process(pred_root, out_path, args):
                 img2video(subfolder_path, video_path)
                 pred_files[name] = video_path
     else:
-        input_path = os.path.join(out_path, "temp")
+        input_path = os.path.abspath(os.path.join(out_path, "temp"))
         os.makedirs(input_path, exist_ok=True)
         for name in pred_names:
             video_path = pred_files[name]
@@ -140,24 +223,33 @@ def process(pred_root, out_path, args):
                 shutil.copy(video_path, new_video_path)
                 pred_files[name] = new_video_path
 
-    input_path = os.path.abspath(input_path)
     args.pred = input_path
     
-    original_dir = os.getcwd()
-    raft_dir = os.path.join(original_dir, "RAFT")
-    os.chdir(raft_dir)
-    from ewarp import Ewarp as Ewarp
-    results, avg_score = Ewarp(args)
-    os.chdir(original_dir)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    calculator = EwarpCalculator(
+        args.model,
+        device,
+        small=args.small,
+        mixed_precision=args.mixed_precision,
+        alternate_corr=args.alternate_corr,
+        iters=args.iters,
+    )
+    results = {}
+    for name, video_path in pred_files.items():
+        score = calculator(video_path)
+        if score is not None:
+            results[name] = score
+    if results:
+        avg_score = float(np.mean(list(results.values())))
+    else:
+        avg_score = None
 
     count = len(results)
-    
     if count > 0:
-        overall_avg = avg_score
         print(results)
     else:
-        overall_avg = {}
         print("No valid samples were processed.")
+    overall_avg = avg_score
 
     print(f"\nProcessed {count} samples.")
     print(f"Average score: {overall_avg}")
@@ -191,6 +283,7 @@ if __name__ == "__main__":
     parser.add_argument('--small', action='store_true', help='use small model')
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--alternate_corr', action='store_true', help='use efficent correlation implementation')
+    parser.add_argument('--iters', type=int, default=20, help='Number of RAFT update iterations')
     parser.add_argument('--out', type=str, default='', help='Path to save JSON output (as directory)')
     args = parser.parse_args()
 

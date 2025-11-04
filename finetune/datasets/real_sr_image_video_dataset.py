@@ -65,6 +65,9 @@ class RealSRImageVideoDataset(Dataset):
         if len(self.images) > len(self.videos):
             repeat_times = math.ceil(len(self.images) / len(self.videos))
             self.videos = (self.videos * repeat_times)[:len(self.images)]
+        elif len(self.images) < len(self.videos):
+            repeat_times = math.ceil(len(self.videos) / len(self.images))
+            self.images = (self.images * repeat_times)[:len(self.videos)]
 
         if caption_column is None:
             self.prompts = [''] * len(self.videos)

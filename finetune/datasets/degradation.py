@@ -12,8 +12,10 @@ from .blur_kernels import random_mixed_kernels
 
 try:
     import av
+    from av.video.frame import PictureType
     has_av = True
 except ImportError:
+    PictureType = None
     has_av = False
 
 
@@ -525,7 +527,10 @@ class RandomVideoCompression:
             for img in padded_imgs:
                 img = img.astype(np.uint8)
                 frame = av.VideoFrame.from_ndarray(img, format='rgb24')
-                frame.pict_type = 'NONE'
+                if PictureType is not None:
+                    frame.pict_type = PictureType.NONE
+                else:
+                    frame.pict_type = 0
                 for packet in stream.encode(frame):
                     container.mux(packet)
 

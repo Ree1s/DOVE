@@ -1,0 +1,677 @@
+\documentclass{article}
+
+
+% if you need to pass options to natbib, use, e.g.:
+    \PassOptionsToPackage{numbers, compress}{natbib}
+% before loading neurips_2025
+
+
+% ready for submission
+% \usepackage{neurips_2025}
+
+
+% to compile a preprint version, e.g., for submission to arXiv, add add the
+% [preprint] option:
+    \usepackage[preprint]{neurips_2025}
+
+
+% to compile a camera-ready version, add the [final] option, e.g.:
+%     \usepackage[final]{neurips_2025}
+
+
+% to avoid loading the natbib package, add option nonatbib:
+%    \usepackage[nonatbib]{neurips_2025}
+
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+
+% add myself
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{subfig}
+\usepackage{makecell}
+\usepackage{colortbl}
+\usepackage{adjustbox}
+\usepackage{caption}
+
+% ------------- Our defined colors
+\definecolor{colorTabTop}{rgb}{0.95,0.93,0.9} %
+\definecolor{colorTab}{rgb}{0.9,0.97,0.9} %
+\definecolor{color3}{rgb}{0.95,0.95,0.95}
+
+% ------------- Our defined commands
+\newcommand\bb[1]{\textbf{#1}}
+\newcommand\ul[1]{\underline{#1}}
+\newcommand\B[1]{\textcolor{blue}{#1}}
+\newcommand\R[1]{\textcolor{red}{#1}}
+\newcommand\etal{\textit{et al.}} 
+\newcommand\eg{\textit{e.g.}}
+\newcommand\ie{\textit{i.e.}}
+
+
+\title{DOVE: Efficient One-Step Diffusion Model for Real-World Video Super-Resolution}
+
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to break the
+% lines. Using \AND forces a line break at that point. So, if LaTeX puts 3 of 4
+% authors names on the first line, and the last on the second line, try using
+% \AND instead of \And before the third author name.
+
+
+\author{
+  Zheng Chen$^{1}$\thanks{Equal contribution.},\enspace 
+  Zichen Zou$^{1}$\footnotemark[1],\enspace 
+  Kewei Zhang$^{1}$,\enspace 
+  Xiongfei Su$^{2}$,\enspace \\
+  \textbf{Xin Yuan$^{2}$,}\enspace 
+  \textbf{Yong Guo$^{3}$,}\enspace 
+  \textbf{Yulun Zhang$^{1}$}\thanks{Corresponding author: Yulun Zhang, yulun100@gmail.com} \\
+  \textsuperscript{1}Shanghai Jiao Tong University,\enspace
+  \textsuperscript{2}Westlake University,\enspace\\
+  \textsuperscript{3}Huawei Consumer Business Group
+  \vspace{-5.mm}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Diffusion models have demonstrated promising performance in real-world video super-resolution (VSR). However, the dozens of sampling steps they require, make inference extremely slow. Sampling acceleration techniques, particularly single-step, provide a potential solution. Nonetheless, achieving one step in VSR remains challenging, due to the high training overhead on video data and stringent fidelity demands. To tackle the above issues, we propose DOVE, an efficient one-step diffusion model for real-world VSR. DOVE is obtained by fine-tuning a pretrained video diffusion model (\ie, CogVideoX). To effectively train DOVE, we introduce the latent-pixel training strategy. The strategy employs a two-stage scheme to gradually adapt the model to the video super-resolution task. Meanwhile, we design a video processing pipeline to construct a high-quality dataset tailored for VSR, termed HQ-VSR. Fine-tuning on this dataset further enhances the restoration capability of DOVE. Extensive experiments show that DOVE exhibits comparable or superior performance to multi-step diffusion-based VSR methods. It also offers outstanding inference efficiency, achieving up to a \textbf{28$\times$} speed-up over existing methods such as MGLD-VSR. Code is available at:~\url{https://github.com/zhengchen1999/DOVE}.
+\end{abstract}
+
+\setlength{\abovedisplayskip}{2pt}
+\setlength{\belowdisplayskip}{2pt}
+
+\vspace{-4.mm}
+\section{Introduction}
+\vspace{-3.mm}
+Video super‑resolution (VSR) is a long‑standing task that aims to reconstruct high‑resolution (HR) videos from low‑resolution (LR) inputs~\cite{jo2018deep,liang2024vrt}. With the rapid growth of smartphone photography and streaming media, real‑world VSR has become increasingly critical. Unlike the synthetic degradations (\eg, bicubic), real-world videos often suffer from complex and unknown degradation. This makes high-quality video restoration difficult. 
+To tackle this issue, numerous methods have been proposed~\cite{yang2021real,pan2021deep,wang2023benchmark,xie2023mitigating,zhang2024realviformer}. 
+Among them, generative models, \eg, generative adversarial networks (GANs), are widely adopted for their ability to synthesize fine details~\cite{goodfellow2014generative,lucas2019generative,chan2022investigating}. 
+
+Recently, a new generative model, the diffusion model (DM), has rapidly gained popularity~\cite{ho2020denoising}. Compared with GANs, diffusion models exhibit stronger generative capabilities, especially those pretrained on large-scale datasets~\cite{rombach2022high,ramesh2022hierarchical,blattmann2023stable,zhang2023i2vgen,yang2024cogvideox}. 
+Therefore, leveraging pretrained diffusion models for VSR has become an increasingly popular direction.
+For instance, some methods adopt pretrained text-to-image (T2I) models~\cite{yang2024motion,zhou2024upscale} and incorporate temporal layers and optical flow constraints to ensure consistency across frames.
+Meanwhile, some approaches directly employ the text-to-video (T2V) model~\cite{he2024venhancer,xie2025star}, and use ControlNet to constrain video generation.
+By exploiting the natural priors in pretrained models, these methods can realize more realistic restorations.
+
+
+
+\begin{figure}[t]
+    \centering
+    \hspace{-0.mm}\includegraphics[width=1.\linewidth]{figs/Compare.pdf} \\
+    \vspace{-2.mm}
+    \caption{Efficiency and performance comparisons on the real-world benchmark (\ie, VideoLQ~\cite{chan2022investigating}). We provide qualitative (left) and quantitative (right) results. The running time (Time) is measured on one A100 GPU using a 33-frame 720$\times$1280 video. Our method achieves impressive performance and excellent efficiency. Compared with MGLD-VSR~\cite{yang2024motion}, DOVE is approximately \textbf{28$\times$} faster.}
+    \label{fig:efficiency}
+    \vspace{-5.mm}
+\end{figure}
+
+
+
+However, existing diffusion-based VSR methods face several critical challenges:
+\textbf{(1) Multi-step sampling restricts efficiency.} To generate high-quality HR videos, these models typically require dozens of sampling steps. This seriously hinders the running efficiency. Moreover, for some methods~\cite{yang2024motion,xie2025star}, long videos are processed in time segments, which further amplifies this inefficiency.
+\textbf{(2) Additional modules increase overhead.} Whether based on T2I or T2V models, many methods introduce auxiliary components~\cite{zhou2024upscale,he2024venhancer}, \eg, ControlNet~\cite{zhang2023adding} or temporal layers, to realize VSR. These additional modules further slow down inference.
+For example, when processing a 33-frame 720$\times$1280 video on an A100 GPU, MGLD-VSR~\cite{yang2024motion} takes 425.23 seconds, while STAR~\cite{xie2025star} requires 173.07 seconds. The high latency hinders the real-world usage of diffusion-based VSR methods.
+
+One common approach to accelerating the diffusion model is to reduce the number of inference steps~\cite{song2020denoising,lu2022dpm}. In this context, single-step inference has attracted widespread attention as an extreme acceleration form. Prior studies have demonstrated that single-step diffusion models achieve impressive results in image/video generation~\cite{sauer2024fast,yin2024improved,zhang2024sf,lin2025diffusion} and image restoration~\cite{wang2023sinsr,wu2024one,li2024distillation} (\eg, image super-resolution) tasks. However, in VSR, single-step diffusion models have rarely been studied.
+There are two critical difficulties in realizing one-step inference in VSR:
+\textbf{(1) Excessive video‑training cost.} To enhance single-step models performance, some methods (\eg, DMD~\cite{yin2024one} and VSD~\cite{wang2023prolificdreamer,wu2024one}) jointly optimize multiple networks. While manageable in the image domain, such overhead becomes burdensome and unacceptable in video due to the multi-frame setting.
+\textbf{(2) High‑fidelity demands in VSR.} Some single‑step video generation models improve generation quality via adversarial training rather than multi‑network distillation~\cite{zhang2024sf,lin2025diffusion}. However, the inherent instability of adversarial training may introduce undesired details in results, hindering VSR performance~\cite{wu2024one}.
+
+To address these challenges, we propose DOVE, an efficient one‑step diffusion model for real‑world video super‑resolution. It is built by fine-tuning an advanced pretrained video generation model (\ie, CogVideoX~\cite{yang2024cogvideox}). Considering the strong prior of the pretrained model, we do not introduce additional components (\eg, optical flow module~\cite{yang2024motion,zhou2024upscale}) to further enhance inference efficiency. 
+
+For effective DOVE training, we introduce the latent-pixel training strategy. Based on the above analysis, we opt for the regression loss instead of distillation or adversarial losses to enhance training efficiency.
+The strategy consists of two stages:
+\textbf{Stage-1: Adaptation.} In the latent space, we minimize the gap between the predicted and HR latent representation. This enables the model to learn one-step LR‑to‑HR mapping.
+\textbf{Stage-2: Refinement.} In the pixel space, we perform mixed training using both images and short video clips. This stage enhances model restoration performance. 
+
+Moreover, fine-tuning pretrained models on high-quality datasets is crucial for achieving strong performance. However, in the field of VSR, suitable public datasets~\cite{zhou2024upscale,nan2024openvid} remain scarce. To address this issue, we design a systematic video processing pipeline. Using the pipeling, we curate a high-quality dataset of 2,055 videos, HQ-VSR, from existing large-scale sources. Equipped with the latent-pixel training strategy and the HQ-VSR dataset, our DOVE achieves impressive performance.
+
+As shown in Fig.~\ref{fig:efficiency}, DOVE outperforms state-of-the-art multi-step diffusion-based VSR methods. Simultaneously, due to one-step inference, our DOVE is up to \textbf{28$\times$} faster over previous diffusion-based VSR methods, \eg, MGLD-VSR~\cite{yang2024motion}. In summary, our contributions include:
+
+\vspace{-1.mm}
+\begin{itemize}
+\vspace{-1.mm}
+\item We propose a novel one-step diffusion model, DOVE, for real-world VSR. To our knowledge, this is the first diffusion-based VSR model with one-step inference.
+
+\vspace{-1.mm}
+\item We design a latent-pixel training strategy and develop a video processing pipeline to construct a high-quality dataset tailored for VSR, enabling effective fine-tuning of DOVE.
+
+\vspace{-1.mm}
+\item Extensive experiments demonstrate that DOVE achieves state-of-the-art performance across multiple benchmarks with remarkable efficiency.
+\end{itemize}
+
+\section{Related Work}
+\subsection{Video Super-Resolution}
+\vspace{-1.mm}
+With the advancement of deep learning, numerous video super-resolution (VSR) methods have emerged~\cite{jo2018deep,nah2019ntire,chan2022basicvsr++,liang2024vrt,chan2021basicvsr}. These approaches (\eg, BasicVSR~\cite{chan2021basicvsr} and Vrt~\cite{liang2024vrt}) utilize a variety of architectures, including recurrent-based~\cite{liang2022recurrent,shi2022rethinking} and sliding-window-based~\cite{li2020mucan,yi2019progressive} models, and have demonstrated promising results. However, these methods typically assume a fixed degradation process~\cite{xue2019video,yi2019progressive}, which limits their performance when confronted with real-world degradation, which is often more complex. To better address such scenarios, some methods, such as RealVSR~\cite{yang2021real} and MVSR4x~\cite{wang2023benchmark}, have utilized HR-LR paired data from real environments. In contrast, others (\eg, RealBasicVSR~\cite{chan2022investigating}) have proposed variable degradation pipelines to enhance the model's adaptability to the complex degradations in real-world VSR. In addition, real-world VSR methods~\cite{zhang2024realviformer,pan2021deep,xie2023mitigating} incorporate structural modifications to tackle these challenges. For example, DBVSR~\cite{pan2021deep} develops an effective kernel estimation method based on the image formation model of video super-resolution. FastRealVSR~\cite{xie2023mitigating} introduces a selective cross-attention (SCA) module to aggregate a refined hidden state from a constructed hidden state pool. Despite the considerable development in these domains, these methods still face persistent challenges in generating delicate textures.
+
+\subsection{Diffusion Model}
+\vspace{-1.mm}
+Diffusion models~\cite{ho2020denoising} have demonstrated strong performance in visual tasks, driving the development of both image generation models~\cite{rombach2022high,ramesh2022hierarchical, Rombach_2022_CVPR} and video generation models~\cite{blattmann2023stable,zhang2023i2vgen,chen2024videocrafter2}. These pretrained models (\eg, Stable Diffusion~\cite{Rombach_2022_CVPR} and I2VGen-XL~\cite{zhang2023i2vgen}) offer rich generative priors, significantly advancing downstream tasks such as video restoration. By leveraging pretrained diffusion models, many video restoration methods~\cite{yang2024motion,zhou2024upscale,he2024venhancer,xie2025star,wang2025seedvr,li2025diffvsr} can recover more realistic video textures. Some approaches~\cite{yang2024motion,zhou2024upscale,li2025diffvsr} adapt pretrained image generation models for VSR tasks, enhancing them to address temporal inconsistencies between frames. For example, Upscale-A-Video~\cite{zhou2024upscale} employs temporal layers to train on a frozen pretrained model, thereby enhancing the temporal consistency of the video. MGLD-VSR~\cite{yang2024motion} also exploits the temporal dynamics in LR videos to guide the pretrained diffusion model, ensuring that the generated HR video maintains a coherent visual flow. Meanwhile, other approaches~\cite{he2024venhancer,xie2025star} utilize video generation models~\cite{chen2024videocrafter2,zhang2023i2vgen} and incorporate ControlNet~\cite{zhang2023adding} to constrain video generation. For instance, STAR~\cite{xie2025star} incorporates ControlNet to condition the video generation model on LR video. However, these methods remain limited by multi-step sampling, which hampers efficiency, and by the added modules, which increase computational overhead, thereby impacting inference speeds.
+
+\subsection{One-Step Acceleration}
+\vspace{-1.mm}
+A common method to accelerate diffusion models is reducing the number of inference steps, with one-step acceleration gaining significant attention as an extreme approach. This technique leverages methods such as rectified flow~\cite{liu2022flow,liu2023instaflow}, adversarial training~\cite{lin2025diffusion,zhang2024sf}, and score distillation~\cite{yin2024one,wang2023prolificdreamer}. Building on these methods, recent image super-resolution (ISR) studies~\cite{wang2024sinsr,li2024distillation,wu2024one,dong2025tsd} have integrated one-step diffusion. For instance, OSEDiff~\cite{wu2024one} applies variational score distillation~\cite{wang2023prolificdreamer} to improve inference efficiency. SinSR~\cite{wang2024sinsr} introduces a deterministic sampling method, while TSD-SR~\cite{dong2025tsd} constructs an efficient one-step diffusion model through target score distillation. However, directly applying these methods to VSR is impractical due to the high computational cost associated with processing multiple video frames. Additionally, some methods (\eg, SF-V~\cite{zhang2024sf} and Adversarial Post-Training~\cite{lin2025diffusion}) have employed adversarial training to explore one-step diffusion in video generation. However, adversarial training methods are inherently unstable. Applying them in VSR, instead of multi-network distillation~\cite{yin2024one,wang2023prolificdreamer}, may introduce unwanted artifacts that degrade the VSR performance~\cite{wu2024one}. In this paper, we introduce a novel and effective one-step diffusion model that successfully accelerates the inference process of video super-resolution.
+
+
+
+\begin{figure}[t]
+    \centering
+    \hspace{-0.mm}\includegraphics[width=1.\linewidth]{figs/Strategy.pdf} \\
+    \vspace{-2.mm}
+    \caption{Overview of the framework and training strategy of DOVE. Our method performs one-step sampling to reconstruct HR videos ($\mathbf{x}_{sr}$) from LR inputs ($\mathbf{x}_{lr}$). To enable effective training, we adopt the two-stage latent-pixel training strategy. \textbf{Stage-1 (latent-space):} Minimize the difference between the predicted and HR latents.
+    \textbf{Stage-2 (pixel-space):} Improve detail generation using mixed \textcolor[HTML]{FFB700}{\textbf{image}} / \textcolor[HTML]{019B28}{\textbf{video}} training, where the data branch at each iteration is controlled by image ratio ($\varphi$). To reduce memory cost, video is processed frame-by-frame in the encoder and decoder.}
+    \label{fig:train}
+    \vspace{-6.mm}
+\end{figure}
+
+
+
+\section{Method}
+\vspace{-1.mm}
+In this section, we introduce the proposed efficient one-step diffusion model, DOVE. First, we present the overall framework of DOVE, which is developed based on CogVideoX to achieve one-step video super-resolution (VSR).
+Then, we describe two key designs that facilitate high-quality fine-tuning: the latent-pixel training strategy and the video processing pipeline.
+
+\subsection{Overall Framework}
+\vspace{-2.mm}
+\label{sec:framework}
+We construct our one-step diffusion network, DOVE, based on a powerful pretrained text-to-video model (\ie, CogVideoX~\cite{yang2024cogvideox}). 
+CogVideoX employs a 3D causal VAE to compress videos into the latent space and uses a Transformer denoiser $\mathbf{v}_\theta$ for diffusion. 
+% More information of CogVideoX are provided in the supplementary material. 
+Leveraging its strong priors, our method can better handle the complexities of real-world scenarios. Meanwhile, to enhance inference efficiency, we do not introduce any auxiliary modules like previous methods~\cite{yang2024motion,zhou2024upscale,he2024venhancer}, such as temporal layers or ControlNet. Instead, we design a two-stage training strategy and curate a high-quality dataset specifically for the VSR task, enabling strong performance with high efficiency.
+
+The overall architecture of DOVE is illustrated in Fig.~\ref{fig:train}. Specifically, given a low-resolution (LR) video $\mathbf{x}_{lr}$, we first upscale it to the target high resolution using bilinear interpolation. The upscaled video is then encoded into a latent representation $\mathbf{z}_{lr}$ by the VAE encoder $\mathcal{E}$. Following previous works~\cite{wu2023seesr,wu2024one}, we take $\mathbf{z}_{lr}$ as the starting point of the diffusion process. That is,  we treat $\mathbf{z}_{lr}$ as the noised latent $\mathbf{z}_t$ at a specific timestep $t$, which is originally formulated as:
+\begin{equation}
+\mathbf{z}_t  = \sqrt{\bar{\alpha}_t} \mathbf{z} + \sqrt{1-\bar{\alpha}_t} \boldsymbol{\epsilon}, \quad \bar{\alpha}_t=\prod_{s=1}^t (\alpha_t), \quad \alpha_t = 1-\beta_s,
+\label{eq:zt}
+\end{equation}
+where $\boldsymbol{\epsilon}$ is the Gaussian noise, $\mathbf{z}$ is the ``clean'' latent sample, and $\beta$ is the noise factor.
+Afterwards, a single denoising step is performed through Transformer $\mathbf{v}_\theta$, yielding the ``clean'' latent $\mathbf{z}_{sr}$ (\ie, $\mathbf{z}$ in Eq.~\eqref{eq:zt}). Since CogVideoX adopts the $v$-prediction formulation, the denoising process is defined as:
+\begin{equation}
+\mathbf{z}_{sr} = \sqrt{\bar{\alpha}_t} \mathbf{z}_{lr} - \sqrt{1-\bar{\alpha}_t} \mathbf{v}_\theta\left(\mathbf{z}_{lr}, \mathbf{c}, t\right).
+\label{eq:denoise}
+\end{equation}
+Unlike the previous approach~\cite{wu2024one} that set $t$ to the total diffusion step (\ie, 999 in CogVideoX), we choose a smaller value.
+This is based on the observation that early diffusion steps focus on global structure while later steps refine fine details. Since the LR video already contains sufficient structural information, starting from the beginning is not needed. Conversely, a tiny $t$ (\ie, late step) would hinder the removal of degradation. Therefore, we empirically set $t$$=$$399$. Finally, the latent $\mathbf{z}_{sr}$ is decoded by the VAE decoder $\mathcal{D}$ to obtain the output video $\mathbf{x}_{sr}$, as the restoration results.
+
+\vspace{-3.mm}
+\subsection{Latent-Pixel Training Strategy}
+\vspace{-2.mm}
+The framework described above enables us to adapt a generative model for the VSR task. However, since the model is designed for multi-step sampling and the distribution of $\mathbf{z}_{lr}$ and $\mathbf{z}_{t}$ are not consistent, the pretrained model cannot be directly applied. Thus, fine-tuning is required to ensure that the reconstructed output $\mathbf{x}_{sr}$, closely matches the high-resolution (HR) ground truth $\mathbf{x}_{hr}$. 
+
+Nevertheless, many one-step fine-tuning strategies developed for images (\eg, DMD~\cite{yin2024one} and VSD~\cite{wang2023prolificdreamer} are not available in the video domain, as the video data volume is larger (due to multiple frames). Besides, adversarial training, which is commonly applied in single-step video generation~\cite{zhang2024sf,lin2025diffusion}, is less suitable for VSR. This is because the inherent instability of adversarial training may lead to undesired details in the results, which are misaligned with the high-fidelity requirements of VSR.
+
+To enable effective training for DOVE, we design a novel latent-pixel training strategy. We adopt the regression loss, instead of distillation or adversarial learning, to improve training efficiency. In addition, we only fine-tune the Transformer component, preserving the priors in the pretrained VAE. The strategy is illustrated in Fig.~\ref{fig:train}, which consists of a two-stage training process. 
+
+\textbf{Stage-1: Adaptation.}
+With the VAE decoder $\mathcal{D}$ fix, making the predicted $\mathbf{x}_{sr}$ close to the high-quality $\mathbf{x}_{hr}$, corresponds to minimizing the difference between $\mathbf{z}_{sr}$ and the HR video latent $\mathbf{z}_{hr}$. 
+
+Due to the high compression ratio of the VAE, training in latent space is more efficient than in pixel space. Therefore, we first minimize the difference between $\mathbf{z}_{sr}$ and $\mathbf{z}_{hr}$. As illustrated in Fig.~\ref{fig:train}, both the LR and HR videos are first encoded into latent representations via the VAE encoder $\mathcal{E}$. We then train the Transformer $\mathbf{v}_\theta$ using the MSE loss (denoted as $\mathcal{L}_{\text {s1}}$). The process is denoted as:
+\begin{equation}
+\begin{gathered}
+\mathcal{L}_{\text{s1}} = \mathcal{L}_{\text{mse}}(\mathbf{z}_{sr}, \mathbf{z}_{hr}) = \frac{1}{\lvert\mathbf{z}_{hr}\rvert} \,
+\bigl\|
+\mathbf{z}_{sr}-\mathbf{z}_{hr}
+\bigr\|_{2}^{2}.
+\end{gathered}
+\end{equation}
+Benefiting from the high computational efficiency in the latent space, we can train the model on videos with longer frame sequences. This enables the model to better handle long-duration video inputs, which are common but challenging in video super-resolution tasks.
+
+\textbf{Stage-2: Refinement.}
+After the first training stage, the model can achieve LR to HR video mapping to a certain extent. However, we observe that the output $\mathbf{x}_{sr}$ exhibits noticeable gaps from the ground-truth $\mathbf{x}_{hr}$. This may be because in the latent space, although $\mathbf{z}_{sr}$ is close to $\mathbf{z}_{hr}$, the slight gap will be further amplified after passing through the VAE decoder $\mathcal{D}$. Therefore, further fine-tuning in pixel space is necessary to reduce reconstruction errors. 
+However, the large volume of video data makes the training overhead in pixel space unacceptable.
+
+To address this issue, we introduce image data for the second stage fine-tuning. An image can be treated as a single-frame video, whose data volume is much smaller than that of multi‑frame sequences, making pixel‑domain training feasible. As illustrated in Fig.~\ref{fig:train}, we minimize the MSE loss between the output image $\hat{\mathbf{x}}_{sr}$ and the HR image $\hat{\mathbf{x}}_{hr}$. Meanwhile, we additionally adopt the perceptual DISTS~\cite{ding2020image} loss, $\mathcal{L}_{\text{dists}}$, to better preserve texture details. The total image loss is defined as:
+\begin{equation}
+\mathcal{L}_{\text{s2-image}} = \mathcal{L}_{\text{mse}}(\hat{\mathbf{x}}_{sr}, \hat{\mathbf{x}}_{hr}) + \lambda_1 \, \mathcal{L}_{\text{dists}}(\hat{\mathbf{x}}_{sr}, \hat{\mathbf{x}}_{hr}),
+\end{equation}
+where $\lambda_1$ is the perceptual loss scaler. After fine-tuning on images in pixel space, the restoration detail is greatly improved. 
+However, since the model is trained only on single-frame data, it exhibits instability when handling multi-frame videos, which adversely affects overall performance. To resolve this issue, we reintroduce video data and adopt a mixed image/video training strategy.
+
+Specifically, we revisited the memory bottlenecks during video training. We find that the VAE is the primary constraint. Inspired by the success of image‑only training, we process videos frame‑by‑frame through the VAE encoder $\mathcal{E}$ and decoder $\mathcal{D}$. This avoids multi‑frame memory spikes. Meanwhile, the Transformer continues to operate on the complete latent. The process (as in Fig.~\ref{fig:train}) is defined as:
+\begin{equation}
+\begin{gathered}
+\mathbf{z}_{lr}^{(t)} = \mathcal{E}\!\bigl(\mathbf{x}_{lr}^{(t)}\bigr), \; t = 1,\dots,n, \quad
+\mathbf{z}_{lr} = \bigl[\mathbf{z}_{lr}^{(1)},\,\mathbf{z}_{lr}^{(2)},\,\dots,\,\mathbf{z}_{lr}^{(n)}\bigr], \quad
+\mathbf{z}_{sr} = \Phi_{\theta}\!\bigl(\mathbf{z}_{lr}\bigr), \\
+\mathbf{x}_{sr}^{(t)} = \mathcal{D}\!\bigl(\mathbf{z}_{sr}^{(t)}\bigr), \; t = 1,\dots,n, \quad
+\mathbf{x}_{sr} = \bigl[\mathbf{x}_{sr}^{(1)},\,\mathbf{x}_{sr}^{(2)},\,\dots,\,\mathbf{x}_{sr}^{(n)}\bigr],
+\end{gathered}
+\end{equation}
+where $\mathbf{x}_{lr}^{(t)}$ and $\mathbf{x}_{sr}^{(t)}$ mean the $t$‑th frame of LR and SR video, respectively; $n$ is the frame number; $\Phi_{\theta}(\cdot)$ denotes the one-step denoising process based on Transformer $\mathbf{v}_{\theta}$ defined in Eq.~\eqref{eq:denoise}. As with the image‑level training, we apply MSE loss and the perceptual DISTS loss. Additionally, to enforce frame consistency, we introduce a frame difference loss:
+\begin{equation}
+\mathcal{L}_{\text{frame}}(\mathbf{x}_{sr}, \mathbf{x}_{hr})
+= \frac{1}{n-1}\sum_{t=2}^{n}
+\bigl\|
+\Delta\mathbf{x}_{\text{sr}}^{(t)}
+-
+\Delta\mathbf{x}_{\text{hr}}^{(t)}
+\bigr\|_{1},
+\quad
+\Delta\mathbf{x}^{(t)} := \mathbf{x}^{(t)} - \mathbf{x}^{(t-1)},
+\end{equation}
+where $\Delta\mathbf{x}^{(t)}$ captures the frame‑to‑frame change. The total loss for video training is computed as:
+\begin{equation}
+\mathcal{L}_{\text{s2-video}} = \mathcal{L}_{\text{mse}}(\mathbf{x}_{sr}, \mathbf{x}_{hr}) + \lambda_1 \, \mathcal{L}_{\text{dists}}(\mathbf{x}_{sr}, \mathbf{x}_{hr}) + \lambda_2 \, \mathcal{L}_{\text{frame}}(\mathbf{x}_{sr}, \mathbf{x}_{hr}) ,
+\end{equation}
+where $\lambda_2$ is the frame loss scaler. By including video data in training, the stability of video processing is improved, further enhancing video restoration performance. 
+
+In summary, our mixed training strategy (combining image and video) in the pixel domain, effectively enhances restoration performance and robustness on videos. Besides, we introduce a hyperparameter $\varphi$ to control the ratio between image and video samples. We study the effect of $\varphi$ in Sec.~\ref{sec:ablation}.
+
+
+
+\begin{figure}[t]
+    \centering
+    \hspace{-0.mm}\includegraphics[width=1.\linewidth]{figs/Pipeline.pdf} \\
+    \vspace{-1.mm}    
+    \caption{The illustration of the video processing pipeline (four steps). Based on this pipeline, we construct HQ-VSR, a high-quality dataset tailored for the VSR task.}
+    \label{fig:data}
+    \vspace{-6.mm}
+\end{figure}
+
+
+
+\subsection{Video Processing Pipeline}
+\vspace{-2.mm}
+
+\noindent \textbf{Motivation.}
+Fine-tuning on high-quality datasets can significantly improve the performance of pretrained models on downstream tasks. However, in the domain of video super-resolution (VSR), suitable public datasets remain scarce. Current VSR methods typically apply the following data: \textbf{(1)} conventional video datasets, \eg, REDS~\cite{nah2019ntire}; \textbf{(2)} self-collected videos, \eg, YouHQ~\cite{zhou2024upscale}; and \textbf{(3)} publicly text-video datasets, \eg, WebVid-10M~\cite{bain2021frozen} and OpenVid-1M~\cite{nan2024openvid}.
+
+Nevertheless, these datasets have some limitations: \textbf{(1)} some contain relatively few data and scenarios; \textbf{(2)} some lack proper curation or filtering specifically for VSR. As a result, fine-tuning on these datasets cannot fully realize the potential of pretrained models in the VSR task.
+
+\noindent \textbf{Pipeline.}
+To address the aforementioned limitations, we propose a systematic video processing pipeline to construct a high-quality dataset tailored for VSR. As shown in Fig.~\ref{fig:data}, the pipeline is:
+
+\textbf{\textit{Step 1: Metadata Filtering.}}
+We begin with a coarse filtering process based on metadata, \ie, video resolution and frame count. We extract all videos with a shorter side that exceeds 720 pixels and over 50 frames. As VSR often targets large-sized videos, the matching training data is required.
+
+\textbf{\textit{Step 2: Scene Filtering.}}
+Following prior work~\cite{blattmann2023stable}, we perform scene detection, segmenting videos into distinct scenes. We discard short clips with fewer than 50 frames. This step reduces cuts and transitions, which are unsuitable for the model to learn coherent video semantics.
+
+\textbf{\textit{Step 3: Quality Filtering.}}
+Next, we score each video with multiple quality metrics. While previous works~\cite{opensora,nan2024openvid} have used metrics like the LAION aesthetic model~\cite{schuhmann2022laion}, these are insufficient, since VSR pays more attention to detail quality. Therefore, we incorporate more metrics: CLIP-IQA~\cite{wang2023exploring}, FasterVQA~\cite{wu2023neighbourhood}, and DOVER~\cite{wu2023exploring}. With more metrics, we achieve stricter filtering.
+
+\textbf{\textit{Step 4: Motion Processing.}}
+Finally, we eliminate videos with insufficient motion. We first estimate optical flow to calculate the motion score, following prior methods~\cite{opensora,blattmann2023stable}. Although the score can filter some still videos, the global score is suboptimal for VSR. In VSR, training data is typically generated via cropping rather than resizing from HR video to preserve fine details. However, high-motion videos may contain static regions (\eg, speech backgrounds in Fig.~\ref{fig:data}), yielding static crops. 
+
+To address this, we introduce the motion area detection algorithm for localized processing (see Fig.~\ref{fig:data}). We generate a motion intensity map $M$ from the optical flow $\mathbf{F}$, and apply a threshold $\tau$ to produce a motion mask. Then, we determine the motion areas based on the mask. To ensure sufficient context, we expand the bounding box by a fixed padding $p$. The procedure is defined as:
+\begin{equation}
+\begin{gathered}
+M_{ij} = \lVert \mathbf{F}_{ij} \rVert_{2},\quad
+\mathcal{S} = \{\, (i,j) \in \Omega \mid M_{ij} > \tau \},
+\\
+\mathbf{B} = \bigl(
+  \min_{(i,j)\in \mathcal{S}} i - p,\,
+  \min_{(i,j)\in \mathcal{S}} j - p,\,
+  \max_{(i,j)\in \mathcal{S}} i + p,\,
+  \max_{(i,j)\in \mathcal{S}} j + p
+\bigr),
+\end{gathered}
+\end{equation}
+where $\Omega$$\subset$$\mathbb{Z}^2$ is the set of all pixel indices; $\mathbf{F}_{ij}$ denotes the optical‑flow vector at pixel $(i,j)$; $\mathcal{S}$ is the motion mask; and $\mathbf{B}$ is the bounding box corresponding to motion areas.
+Finally, we crop the video according to the bounding box $\mathbf{B}$, and discard the cropped region with resolution lower than 720p.
+
+\textbf{HQ-VSR.}
+We apply the proposed pipeline to the public dataset OpenVid‑1M~\cite{nan2024openvid}, which contains diverse scenes. Based on this, we extract 2,055 high-quality video samples suitable for VSR, forming a new dataset, HQ-VSR. The detailed pipeline configuration is provided in the supplementary material. Fine-tuning our DOVE on the HQ-VSR yields superior performance compared to other datasets. 
+
+\section{Experiments}
+\subsection{Experimental Settings}
+\label{sec:setting}
+\noindent \textbf{Datasets.}
+The training dataset comprises video and image datasets. The video dataset, HQ-VSR, includes 2,055 high-quality videos, and adopts the RealBasicVSR~\cite{chan2022investigating} degradation pipeline to synthesize LQ-HQ pairs. The image dataset is DIV2K~\cite{cai2019toward}, with 900 images, which follows the Real-ESRGAN~\cite{wang2021real} degradation process. For evaluation, we apply both synthetic and real-world datasets. The synthetic datasets include UDM10~\cite{tao2017detail}, SPMCS~\cite{yi2019progressive}, and YouHQ40~\cite{zhou2024upscale}, using the same degradations as training. For real-world datasets, we apply RealVSR~\cite{yang2021real}, MVSR4x~\cite{wang2023benchmark}, and VideoLQ~\cite{chan2022investigating}.
+RealVSR and MVSR4x contain real-world LQ-HQ pairs captured via mobile phones, while VideoLQ is Internet-sourced without HQ references.
+All experiments are conducted with a scaling factor $\times$4.
+
+\noindent \textbf{Evaluation Metrics.}
+We adopt multiple evaluation metrics to assess model performance, which are categorized into two types: image quality assessment (IQA) and video quality assessment (VQA). The IQA metrics include two fidelity measures: PSNR and SSIM~\cite{wang2004image}. We also use some perceptual quality IQA metrics: LPIPS~\cite{zhang2018unreasonable}, DISTS~\cite{ding2020image}, and CLIP-IQA~\cite{wang2023exploring}. For VQA, we employ FasterVQA~\cite{wu2023neighbourhood} and DOVER~\cite{wu2023exploring} to evaluate overall video quality. Meanwhile, we adopt the flow warping error $E^*_{warp}$, refers to $E_{warp}$ ($\times$10$^{-3}$)~\cite{lai2018learning}, to assess temporal consistency. Through these metrics, we conduct a comprehensive evaluation of video quality.
+
+\noindent \textbf{Implementation Details.}
+Our DOVE is based on the text-to-video model, CogVideoX1.5~\cite{yang2024cogvideox}. We use an empty text as the prompt, which is pre-encoded in advance to reduce inference overhead. The proposed two-stage training strategy is then applied for fine-tuning. Both stages are trained on 4 NVIDIA A800-80G GPUs with the total batch size 8. We use the AdamW optimizer~\cite{loshchilov2017fixing} with ${\beta}_1$$=$$0.9$, ${\beta}_2$$=$$0.95$, and ${\beta}_3$$=$$0.98$. In stage-1, training is conducted on video data. The videos have a resolution of 320$\times$640 and a frame length of 25. The model is trained for 10,000 iterations with a learning rate of 2$\times$10$^{-5}$. In stage-2, both video and image data are used, with $\varphi$$=$0.8 (\ie, images comprising 80\% of the input). All inputs have a resolution of 320$\times$640. The model is trained for 500 iterations with a learning rate of 5$\times$10$^{-6}$. The loss weights $\lambda_1$ and $\lambda_2$ are set to 1.
+
+
+
+\begin{table*}[t]
+\scriptsize
+\hspace{-2.3mm}
+\centering
+\subfloat[Ablation on training strategy. \label{tab:abl_stage}]{
+        \scalebox{1.}{
+        \setlength{\tabcolsep}{1.88mm}
+            \begin{tabular}{l | c c c c c c c}
+            \toprule
+            \rowcolor{color3}  Training Stage & S1 & S1+S2-I & S1+S2-I/V\\
+            \midrule
+            PSNR $\uparrow$ & \textbf{27.20} & 26.39 & 26.48\\
+            LPIPS $\downarrow$ & 0.3037 & 0.2784 & \textbf{0.2696}\\
+            CLIP-IQA $\uparrow$ & 0.3236 & 0.5085 & \textbf{0.5107}\\
+            DOVER $\uparrow$ & 0.6154 & 0.7694 & \textbf{0.7809}\\
+            \bottomrule
+            \end{tabular}
+}}\hspace{-0.mm}
+\subfloat[Ablation on image ratio ($\varphi$) in stage-2. \label{tab:abl_ratio}]{
+        \scalebox{1.}{
+        \setlength{\tabcolsep}{1.87mm}
+            \begin{tabular}{l | c c c c c c c}
+            \toprule
+            \rowcolor{color3} Image Ratio & 0\% (video) & 20\% & 50\% & 80\% & 100\% (image) \\
+            \midrule
+            PSNR $\uparrow$ & 26.41 & 26.41 & 26.44  & \textbf{26.48} & 26.39\\
+            LPIPS $\downarrow$ & 0.2624 & \textbf{0.2617} & 0.2686  & 0.2696 & 0.2784\\
+            CLIP-IQA $\uparrow$ & 0.4800 & 0.5012 & 0.5027  & \textbf{0.5107} & 0.5085\\
+            DOVER $\uparrow$ & 0.7647 & 0.7701 & 0.7751  & \textbf{0.7809} & 0.7694\\
+            \bottomrule
+            \end{tabular}
+}}\vspace{-1mm}\\
+
+\hspace{-2.5mm}
+\subfloat[Ablation on training dataset. \label{tab:abl_dataset}]{
+        \scalebox{1.}{
+        \setlength{\tabcolsep}{1.50mm}
+            \begin{tabular}{l| c c c c c c }
+            \toprule
+            \rowcolor{color3} Dataset & PSNR $\uparrow$ & LPIPS $\downarrow$ & CLIP-IQA $\uparrow$ & DOVER $\uparrow$\\
+            \midrule
+            YouHQ & 26.88 & 0.3383 & 0.2496 & 0.3965 \\
+            OpenVid-1M & 27.04 & 0.3376 & 0.2683 & 0.4363 \\
+            HQ-VSR & \textbf{27.20} & \textbf{0.3037} & \textbf{0.3236} & \textbf{0.6154} \\
+            \bottomrule
+            \end{tabular}
+}}\hspace{-0.mm}
+\subfloat[Ablation on processing pipeline. \label{tab:abl_pipeline}]{
+        \scalebox{1.}{
+        \setlength{\tabcolsep}{1.50mm}
+            \begin{tabular}{l|c c c  c c c}
+            \toprule
+            \rowcolor{color3} Pipeline & PSNR $\uparrow$ & LPIPS $\downarrow$ & CLIP-IQA $\uparrow$ & DOVER $\uparrow$\\
+            \midrule
+            OpenVid-1M & 27.04 & 0.3376 & 0.2683 & 0.4363 \\
+            $+$Filter & 27.09 & 0.3236 & 0.2894 & 0.5357 \\
+            $+$Motion & \textbf{27.20} & \textbf{0.3037} & \textbf{0.3236} & \textbf{0.6154} \\
+            \bottomrule 
+            \end{tabular}
+}}\vspace{-0mm}\\
+
+\caption{Ablation study. Evaluation is conducted on UDM10. (a) S1/S2: stage-1/2; I: image-only training; I/V: image-video mixed training. (b) 0\%: video-only; 100\%: image-only. (c): Experiments on stage-1. (d) $+$Filter: apply steps 2\textasciitilde4; $+$Motion: further apply step 5 (motion processing).}
+\label{tab:ablation}
+\vspace{-4.mm}
+\end{table*}
+
+
+
+\vspace{-1.mm}
+\subsection{Ablation Study}
+\vspace{-1.mm}
+\label{sec:ablation}
+We investigate the effectiveness of the proposed latent-pixel training strategy and video processing pipeline. All training configurations are kept consistent with settings described in Sec.~\ref{sec:setting}. We evaluate all models on UDM10~\cite{tao2017detail}. Results are presented in Tab.~\ref{tab:ablation}.
+
+\noindent \textbf{Training Strategy.}
+We study the effects of the latent-pixel training strategy, as shown in Tab.~\ref{tab:abl_stage}. In the stage-1 (S1), where training is conducted in latent space with MSE loss, the results tend to be overly smooth, leading to lower perceptual performance. After fine-tuning in pixel space during stage-2 (S2), perceptual metrics (\ie, LPIPS, CLIP-IQA, and DOVER), improve significantly. Furthermore, using a mixed training scheme with both images and videos in stage-2 (S2-I/V) leads to further performance gains, demonstrating the effectiveness of hybrid training.
+
+\noindent \textbf{Image Ratio ($\varphi$).}
+We further investigate the impact of the image data ratio in stage-2. The results are presented in Tab.~\ref{tab:abl_ratio}. Specifically, ratio-0\% denotes training with video data only, while 100\% uses only image data.
+Neither alone yields optimal results, since videos suffer from lower quality due to hardware limitations; while with higher quality are limited by the single-frame nature. Conversely, mixing both offers complementary strengths and improves overall performance. Based on the experiments, we finally set the image ratio to 80\% (\ie, $\varphi$$=$0.8).
+
+\vspace{-1.mm}
+\noindent \textbf{Training Dataset.}
+We compare different training datasets. To eliminate the influence of image data, we conduct training only in stage-1. The results are listed in Tab.~\ref{tab:abl_dataset}. For OpenVid-1M~\cite{nan2024openvid}, we select videos with a resolution higher than 1080p (1080$\times$1920), resulting in approximately 0.4M videos. The YouHQ dataset~\cite{zhou2024upscale} contains 38,576 1080p videos. We observe substantial performance variation across datasets. Notably, our proposed HQ-VSR dataset achieves superior performance despite containing 2,055 videos, which is significantly fewer than the other datasets. 
+
+\vspace{-1.mm}
+\noindent \textbf{Video Processing Pipeline.}
+We also performed an ablation on the proposed video processing pipeline. The results are presented in Tab.~\ref{tab:abl_pipeline}. First, we apply the filtering steps (\ie, $+$Filter), including metadata, scene, and quality filtering) to the raw dataset (\ie, OpenVid-1M~\cite{nan2024openvid}). Although OpenVid has undergone some preprocessing, applying more filtering tailored to VSR further improves data quality.
+Then, we apply motion processing on the filtered data to exclude static videos and regions. This leads to further performance gains, confirming the benefit of motion detection cropping.
+
+
+
+\begin{table*}[t]
+    \scriptsize
+    \hspace{-2.mm}
+    \centering
+    \resizebox{\linewidth}{!}{
+        \setlength{\tabcolsep}{1.8mm}
+        \begin{tabular}{l|l|c|c||c|c|c|c|c|c}
+            \toprule[0.1em]
+            \rowcolor{color3}
+            \rowcolor{color3} & & RealESRGAN & ResShift  & RealBasicVSR  & Upscale-A-Video  & MGLD-VSR & VEnhancer & STAR  & DOVE \\
+            \rowcolor{color3} \multirow{-2}{*}{Dataset} & \multirow{-2}{*}{Metric} & \cite{wang2021real}  & \cite{yue2023resshift} & \cite{chan2022investigating} & \cite{zhou2024upscale} & \cite{yang2024motion} & \cite{he2024venhancer} & \cite{xie2025star} & (ours) \\
+            \midrule[0.1em]
+            \multirow{8}{*}{UDM10}
+                & PSNR $\uparrow$         & 24.04 & 23.65 & 24.13 & 21.72 & \textcolor{blue}{24.23} & 21.32 & 23.47 & \textcolor{red}{26.48} \\
+                & SSIM $\uparrow$         & \textcolor{blue}{0.7107} & 0.6016 & 0.6801 & 0.5913 & 0.6957 & 0.6811 & 0.6804 & \textcolor{red}{0.7827} \\
+                & LPIPS $\downarrow$      & 0.3877 & 0.5537 & 0.3908 & 0.4116 & \textcolor{blue}{0.3272} & 0.4344 & 0.4242 & \textcolor{red}{0.2696} \\
+                & DISTS $\downarrow$      & 0.2184 & 0.2898 & 0.2067 & 0.2230 & \textcolor{blue}{0.1677} & 0.2310 & 0.2156 & \textcolor{red}{0.1492} \\
+                & CLIP-IQA $\uparrow$     & 0.4189 & 0.4344 & 0.3494 & \textcolor{blue}{0.4697} & 0.4557 & 0.2852 & 0.2417 & \textcolor{red}{0.5107} \\
+                & FasterVQA $\uparrow$    & 0.7386 & 0.4772  & \textcolor{blue}{0.7744}  & 0.6969  & 0.7489 & 0.5493 & 0.7042 & \textcolor{red}{0.8064} \\
+                & DOVER $\uparrow$        & 0.7060 & 0.3290 & \textcolor{blue}{0.7564} & 0.7291 & 0.7264 & 0.4576 & 0.4830 & \textcolor{red}{0.7809} \\
+                & $E^*_{warp} \downarrow$ & 4.83   & 6.12   & 3.10   & 3.97   & 3.59   & \textcolor{red}{1.03} & 2.08 & \textcolor{blue}{1.77} \\
+            \midrule
+            \multirow{8}{*}{SPMCS}
+                & PSNR $\uparrow$         & 21.22 & 21.68 & 22.17 & 18.81 & \textcolor{blue}{22.39} & 18.58 & 21.24 & \textcolor{red}{23.11} \\
+                & SSIM $\uparrow$         & 0.5613 & 0.5153 & 0.5638 & 0.4113 & \textcolor{blue}{0.5896} & 0.4850 & 0.5441 & \textcolor{red}{0.6210} \\
+                & LPIPS $\downarrow$      & 0.3721 & 0.4467 & 0.3662 & 0.4468 & \textcolor{blue}{0.3263} & 0.5358 & 0.5257 & \textcolor{red}{0.2888} \\
+                & DISTS $\downarrow$      & 0.2220 & 0.2697 & 0.2164 & 0.2452 & \textcolor{blue}{0.1960} & 0.2669 & 0.2872 & \textcolor{red}{0.1713} \\
+                & CLIP-IQA $\uparrow$     & 0.5238 & \textcolor{blue}{0.5442} & 0.3513 & 0.5248 & 0.4348 & 0.3188 & 0.2646 & \textcolor{red}{0.5690} \\
+                & FasterVQA $\uparrow$    & 0.7213 & 0.5463 & \textcolor{red}{0.7307} & 0.6556  & 0.6745 & 0.4658 & 0.4076 & \textcolor{blue}{0.7245 } \\
+                & DOVER $\uparrow$        & \textcolor{blue}{0.7490} & 0.4930 & 0.6753 & 0.7171 & 0.6754 & 0.4284 & 0.3204 & \textcolor{red}{0.7828} \\
+                & $E^*_{warp} \downarrow$ & 5.61   & 8.07   & 1.88   & 4.22   & 1.68   & 1.19   & \textcolor{red}{1.01} & \textcolor{blue}{1.04} \\
+            \midrule
+            \multirow{8}{*}{YouHQ40}
+                & PSNR $\uparrow$         & 22.82 & \textcolor{blue}{23.32} & 22.39 & 19.62 & 23.17 & 19.78 & 22.64 & \textcolor{red}{24.30} \\
+                & SSIM $\uparrow$         & \textcolor{blue}{0.6337} & 0.6273 & 0.5895 & 0.4824 & 0.6194 & 0.5911 & 0.6323 & \textcolor{red}{0.6740} \\
+                & LPIPS $\downarrow$      & \textcolor{blue}{0.3571} & 0.4211 & 0.4091 & 0.4268 & 0.3608 & 0.4742 & 0.4600 & \textcolor{red}{0.2997} \\
+                & DISTS $\downarrow$      & 0.1790 & 0.2159 & 0.1933 & 0.2012 & \textcolor{blue}{0.1685} & 0.2140 & 0.2287 & \textcolor{red}{0.1477} \\
+                & CLIP-IQA $\uparrow$     & 0.4704 & 0.4633 & 0.3964 & \textcolor{red}{0.5258} & 0.4657 & 0.3309 & 0.2739 & \textcolor{blue}{0.4985} \\
+                & FasterVQA $\uparrow$    & 0.8401 & 0.7024 & 0.8423 & \textcolor{blue}{0.8460} & 0.8363 & 0.7022 & 0.5586 & \textcolor{red}{0.8494} \\
+                & DOVER $\uparrow$        & 0.8572 & 0.6855 & \textcolor{red}{0.8596} & \textcolor{red}{0.8596} & 0.8446 & 0.6957 & 0.5594 & 0.8574 \\
+                & $E^*_{warp} \downarrow$ & 5.91   & 5.75   & 3.08   & 6.84   & 3.45   & \textcolor{red}{0.95}   & 2.21 & \textcolor{blue}{2.05} \\
+            \midrule
+            \multirow{8}{*}{RealVSR}
+                & PSNR $\uparrow$         & 20.85 & 20.81 & \textcolor{blue}{22.12} & 20.29 & 22.02 & 15.75 & 17.43 & \textcolor{red}{22.32} \\
+                & SSIM $\uparrow$         & 0.7105 & 0.6277 & \textcolor{blue}{0.7163} & 0.5945 & 0.6774 & 0.4002 & 0.5215 & \textcolor{red}{0.7301} \\
+                & LPIPS $\downarrow$      & 0.2016 & 0.2312 & \textcolor{blue}{0.1870} & 0.2671 & 0.2182 & 0.3784 & 0.2943 & \textcolor{red}{0.1851} \\
+                & DISTS $\downarrow$      & 0.1279 & 0.1435 & \textcolor{blue}{0.0983} & 0.1425 & 0.1169 & 0.1688 & 0.1599 & \textcolor{red}{0.0978} \\
+                & CLIP-IQA $\uparrow$     & \textcolor{red}{0.7472} & \textcolor{blue}{0.5553} & 0.2905 & 0.4855 & 0.4510 & 0.3880 & 0.3641 & 0.5207 \\
+                & FasterVQA $\uparrow$    & 0.7436 & 0.6988 & 0.7789 & 0.7403 &0.7707 & \textcolor{red}{0.8018} & 0.7338     & \textcolor{blue}{0.7959} \\
+                & DOVER $\uparrow$        & 0.7542 & 0.7099 & 0.7636 & 0.7114 & 0.7508 & \textcolor{blue}{0.7637} & 0.7051 & \textcolor{red}{0.7867} \\
+                & $E^*_{warp} \downarrow$ & 6.32   & 9.55   & 4.45   & 6.25   & \textcolor{red}{3.16} & 5.15  & 9.88  & \textcolor{blue}{3.52} \\
+            \midrule
+            \multirow{8}{*}{MVSR4x}
+                & PSNR $\uparrow$         & \textcolor{blue}{22.47} & 21.58 & 21.80 & 20.42 & \textcolor{red}{22.77} & 20.50 & 22.42 & 22.42 \\
+                & SSIM $\uparrow$         & 0.7412 & 0.6473 & 0.7045 & 0.6117 & 0.7418  & 0.7117 & \textcolor{blue}{0.7421} & \textcolor{red}{0.7523} \\
+                & LPIPS $\downarrow$      & 0.4534 & 0.5945 & 0.4235 & 0.4717 & \textcolor{blue}{0.3568} & 0.4471 & 0.4311 & \textcolor{red}{0.3476} \\
+                & DISTS $\downarrow$      & 0.3021 & 0.3351 & 0.2498 & 0.2673 & \textcolor{red}{0.2245} & 0.2800 & 0.2714 & \textcolor{blue}{0.2363} \\
+                & CLIP-IQA $\uparrow$     & 0.4396 & 0.5003 & 0.4118 & \textcolor{red}{0.6106} & 0.3769 & 0.3104 & 0.2674 & \textcolor{blue}{0.5453} \\
+                & FasterVQA $\uparrow$    & 0.3371 & 0.4723 & 0.7497 & \textcolor{blue}{0.7663} & 0.6764 & 0.3584 & 0.2840 & \textcolor{red}{0.7742} \\
+                & DOVER $\uparrow$        & 0.2111 & 0.3255 & 0.6846 & \textcolor{blue}{0.7221} & 0.6214 & 0.3164 & 0.2137 & \textcolor{red}{0.6984} \\
+                & $E^*_{warp} \downarrow$ & 1.64   & 3.89   & 1.69   & 5.10   & 1.55   & \textcolor{blue}{0.62}   & \textcolor{red}{0.61} & 0.78 \\
+            \midrule
+            \multirow{4}{*}{VideoLQ}
+                & CLIP-IQA $\uparrow$     & 0.3617 & \textcolor{blue}{0.4049} & 0.3433 & \textcolor{red}{0.4132} & 0.3465 & 0.3031 & 0.2652 & 0.3484 \\
+                & FasterVQA $\uparrow$    & 0.7381 & 0.5909 & \textcolor{blue}{0.7586} & 0.7501 & 0.7412 & 0.6769 & 0.7028 & \textcolor{red}{0.7764} \\
+                & DOVER $\uparrow$        & 0.7310 & 0.6160 & 0.7388 & 0.7370 & \textcolor{blue}{0.7421} & 0.6912 & 0.7080 & \textcolor{red}{0.7435} \\
+                & $E^*_{warp} \downarrow$ & 7.58   & 7.79   & 5.97   & 13.47   & 6.79   & 6.50  & \textcolor{blue}{5.96} & \textcolor{red}{5.85} \\
+            \bottomrule[0.1em]
+        \end{tabular}
+    }
+    \vspace{-1.mm}
+    \caption{Quantitative comparison with state-of-the-art methods. The best and second best results are colored with \textcolor{red}{red} and \textcolor{blue}{blue}. Our method outperforms on various datasets and metrics.}
+    \vspace{-7.mm}
+    \label{tab:quantitative}
+\end{table*}
+
+
+
+\vspace{-4.mm}
+\subsection{Comparison with State-of-the-Art Methods}
+\vspace{-3.mm}
+We compare our efficient one-step diffusion model, DOVE, with recent state-of-the-art image and video super-resolution methods: RealESRGAN~\cite{wang2021real}, ResShift~\cite{yue2023resshift}, RealBasicVSR~\cite{chan2022investigating}, Upscale-A-Video~\cite{zhou2024upscale}, MGLD-VSR~\cite{yang2024motion}, VEnhancer~\cite{he2024venhancer}, and STAR~\cite{xie2025star}.
+
+\noindent \textbf{Quantitative Results.}
+We present quantitative comparisons in Tab.~\ref{tab:quantitative}. Our DOVE achieves outstanding performance across diverse datasets. For fidelity metrics (\ie, PSNR and SSIM), our model achieves the best performance on most datasets. For perceptual metrics (\ie, LPIPS, DISTS, and CLIP-IQA), the DOVE ranks first or second on five datasets. Furthermore, for video-specific metrics regarding quality (\ie, FasterVQA and DOVER) and consistency (\eg, $E^*_{warp}$), the DOVE also performs strongly. Overall, the comprehensive evaluations validate the superiority of our method.
+
+
+
+\begin{figure*}[!t]
+\scriptsize
+\centering
+\begin{tabular}{cccccccc}
+
+% % one row
+\hspace{-0.48cm}
+\begin{adjustbox}{valign=t}
+\begin{tabular}{c}
+\includegraphics[width=0.22\textwidth]{figs/visual/main/Resize_ComL_LR_YouHQ40_036_0023.png}
+\\
+YouHQ40: 023
+\end{tabular}
+\end{adjustbox}
+\hspace{-0.46cm}
+\begin{adjustbox}{valign=t}
+\begin{tabular}{cccccc}
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_HR_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_LR_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_ResShift_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_UAV_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\\ 
+HR \hspace{-4.mm} &
+LR \hspace{-4.mm} &
+ResShift~\cite{yue2023resshift} \hspace{-4.mm} &
+Upscale-A-Video~\cite{zhou2024upscale} \hspace{-4.mm} &
+\\
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_MGLDVSR_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_VEnhancer_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_STAR_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_DOVE_YouHQ40_036_0023.png} \hspace{-4.mm} &
+\\ 
+MGLD-VSR~\cite{yang2024motion} \hspace{-4.mm} &
+VEnhancer~\cite{he2024venhancer} \hspace{-4.mm} &
+STAR~\cite{xie2025star} \hspace{-4.mm} &
+DOVE (ours) \hspace{-4mm}
+\\
+\end{tabular}
+\end{adjustbox}
+\\
+
+% % one row
+\hspace{-0.48cm}
+\begin{adjustbox}{valign=t}
+\begin{tabular}{c}
+\includegraphics[width=0.22\textwidth]{figs/visual/main/Resize_ComL_LR_VideoLQ_041_0000.png}
+\\
+VideoLQ: 041
+\end{tabular}
+\end{adjustbox}
+\hspace{-0.46cm}
+\begin{adjustbox}{valign=t}
+\begin{tabular}{cccccc}
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_LR_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_ResShift_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_RealBasicVSR_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_UAV_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\\ 
+LR \hspace{-4.mm} &
+ResShift~\cite{yue2023resshift} \hspace{-4.mm} &
+RealBasicVSR~\cite{chan2022investigating} \hspace{-4.mm} &
+Upscale-A-Video~\cite{zhou2024upscale} \hspace{-4.mm} &
+\\
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_MGLDVSR_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_VEnhancer_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_STAR_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\includegraphics[width=0.189\textwidth]{figs/visual/main/ComS_DOVE_VideoLQ_041_0000.png} \hspace{-4.mm} &
+\\ 
+MGLD-VSR~\cite{yang2024motion} \hspace{-4.mm} &
+VEnhancer~\cite{he2024venhancer} \hspace{-4.mm} &
+STAR~\cite{xie2025star} \hspace{-4.mm} &
+DOVE (ours) \hspace{-4mm}
+\\
+\end{tabular}
+\end{adjustbox}
+
+\end{tabular}
+\vspace{-2.mm}
+\caption{Visual comparison on synthetic (YouHQ40~\cite{zhou2024upscale}) and real-world (VideoLQ~\cite{chan2022investigating}) datasets. The videos in VideoLQ are sourced from the Internet without high-resolution (HQ) references.}
+\label{fig:visual}
+\vspace{-2.mm}
+\end{figure*}
+
+
+
+\noindent \textbf{Qualitative Results.}
+We provide visual comparisons on both synthetic (\ie, YouHQ40) and real-world (\ie, VideoLQ) videos in Fig.~\ref{fig:visual}. Our DOVE produces more realistic results. For instance, in the first case, DOVE successfully reconstructs the brick pattern, while other methods yield overly smooth or inaccurate results. Similarly, in the second example, our method delivers sharper restoration. More visual results are provided in the supplementary material.
+
+
+
+\begin{figure*}[t]
+    \centering
+    % Left: Figure
+    \hspace{-1.mm}
+    \begin{minipage}[t]{0.46\linewidth}
+        \vspace{-12.5mm}
+        \centering
+        \includegraphics[width=\linewidth]{figs/Consistency.pdf}
+        \vspace{-5.mm}
+        \captionof{figure}{Comparison of temporal consistency (stacking the \textcolor{red}{red} line across frames).}
+        \label{fig:consist}
+    \end{minipage}
+    \hspace{1.mm}
+    \begin{minipage}[t]{0.51\linewidth}
+        \centering
+        \scriptsize
+        \setlength{\tabcolsep}{3.0mm}
+        \begin{tabular}{l|ccc}
+            \toprule[0.1em]
+            \rowcolor{color3}
+            Method & Step & Time (s) & Performance\\
+            \midrule[0.1em]
+            Upscale-A-Video~\cite{zhou2024upscale} & 30 & 279.32 & 0.7370\\
+            MGLD-VSR~\cite{yang2024motion} & 50 & 425.23 & 0.7421\\
+            VEnhancer~\cite{he2024venhancer} & 15 & 121.27 & 0.6912\\
+            STAR~\cite{xie2025star} & 15 & 173.07 & 0.7080\\
+            \textbf{DOVE (ours)} & \textbf{1} & \textbf{14.90} & \textbf{0.7435}\\
+            \bottomrule[0.1em]
+        \end{tabular}
+        % \vspace{-1mm}
+        \captionof{table}{Comparison of inference step (Step), running time (Time), and DOVER on VideoLQ (Performance) of different diffusion-based methods.}
+        \label{tab:time}
+    \end{minipage}
+    \vspace{-6.mm}
+\end{figure*}
+
+
+
+\noindent \textbf{Temporal Consistency.}
+ We also visualize the temporal profile in Fig.~\ref{fig:consist}. We can observe that existing methods struggle under complex degradations, exhibiting misalignment (\eg, Upscale-A-Video~\cite{zhou2024upscale} and STAR~\cite{xie2025star}) or blurring (\eg, MGLD-VSR~\cite{yang2024motion}). In contrast, our method achieves excellent temporal consistency, with smooth transitions and rich details across frames. This is due to the strong prior of the pretrained model and our effective latent-space training strategy.
+
+\noindent \textbf{Running Time Comparisons.}
+We compare the inference step (Step), running time (Time), and performance (DOVER on VideoLQ~\cite{chan2022investigating}) of different diffusion-based video super-resolution methods in Tab.~\ref{tab:time}. For fairness, all methods are measured running time on the same A100 GPU, generating a 33-frame 720$\times$1280 video. Our method is approximately \textbf{28$\times$} faster than MGLD-VSR~\cite{yang2024motion}. Even compared with the fastest compared method, VEnhancer~\cite{he2024venhancer}, the DOVE is \textbf{8} times faster.
+More comprehensive analyses are provided in the supplementary material.
+
+\vspace{-3.mm}
+\section{Conclusion}
+\vspace{-3.mm}
+In this paper, we propose an efficient one-step diffusion model, DOVE, for real-world video super-resolution (VSR). DOVE is constructed based on the pretrained video generation model, CogVideoX. To enable effective fine-tuning, we introduce the latent-pixel training strategy. It is a two-stage scheme that gradually adapts the pretrained video model to the VSR task. Moreover, we construct a high-quality dataset, HQ-VSR, to further enhance performance. The dataset is generated by our proposed video processing pipeline, which is tailored for VSR. Extensive experiments demonstrate that our DOVE outperforms state-of-the-art methods with high efficiency.
+
+
+
+{\small
+\bibliographystyle{plain}
+\bibliography{bib_conf}
+}
+
+
+
+\end{document}

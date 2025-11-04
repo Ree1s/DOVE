@@ -269,6 +269,8 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         token_merge_default_ratio: float = 0.0,
         token_merge_seed: int = 42,
         restore_adapter_expansion: int = 2,
+        token_merge_window_size: int = 0,
+        token_merge_window_stride: int = 1,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -365,6 +367,8 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             default_ratio=token_merge_default_ratio,
             seed=token_merge_seed,
             restore_adapter_expansion=restore_adapter_expansion,
+            window_size=token_merge_window_size,
+            window_stride=token_merge_window_stride,
         )
 
     @property
@@ -480,12 +484,16 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         default_ratio: float,
         seed: int,
         restore_adapter_expansion: int,
+        window_size: int,
+        window_stride: int,
     ) -> None:
         self.config.enable_token_merge = bool(enable_token_merge)
         self.config.token_merge_routes = routes_spec
         self.config.token_merge_default_ratio = float(default_ratio)
         self.config.token_merge_seed = int(seed)
         self.config.restore_adapter_expansion = int(restore_adapter_expansion)
+        self.config.token_merge_window_size = int(window_size)
+        self.config.token_merge_window_stride = int(window_stride)
 
         routes: List[Dict[str, Any]] = []
         num_layers = len(self.transformer_blocks)
@@ -521,8 +529,12 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         self._token_merge_seed = seed
         self._warned_rotary_batch_mismatch = False
 
-        self.router = Router(seed=seed) if should_enable else None
-        self.restore_adapter = RestoreAdapter(self._inner_dim, expansion=restore_adapter_expansion) if should_enable else None
+        if should_enable:
+            self.router = Router(seed=seed, window_size=window_size, window_stride=window_stride)
+            self.restore_adapter = RestoreAdapter(self._inner_dim, expansion=restore_adapter_expansion)
+        else:
+            self.router = None
+            self.restore_adapter = None
         for head in self.metric_heads:
             head.requires_grad_(should_enable)
 
@@ -533,8 +545,52 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         default_ratio: float,
         seed: int,
         restore_adapter_expansion: int,
+        window_size: int = 0,
+        window_stride: int = 1,
     ) -> None:
-        self._configure_token_merge(enable_token_merge, routes_spec, default_ratio, seed, restore_adapter_expansion)
+        self._configure_token_merge(
+            enable_token_merge,
+            routes_spec,
+            default_ratio,
+            seed,
+            restore_adapter_expansion,
+            window_size,
+            window_stride,
+        )
+
+    def freeze_parameters_to_routes(self) -> None:
+        """Freeze all parameters except those belonging to routed transformer layers."""
+        if not self._routes:
+            logger.warning(
+                "freeze_parameters_to_routes called but no token merge routes are configured. Skipping." 
+            )
+            return
+
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        train_layers = set()
+        for route in self._routes:
+            train_layers.update(range(route["start_layer"], route["end_layer"] + 1))
+
+        valid_layers = sorted(idx for idx in train_layers if 0 <= idx < len(self.transformer_blocks))
+        if not valid_layers:
+            logger.warning(
+                "No valid transformer layers fall inside the configured routes; leaving all parameters frozen."
+            )
+            return
+
+        for idx in valid_layers:
+            for param in self.transformer_blocks[idx].parameters():
+                param.requires_grad_(True)
+            for param in self.metric_heads[idx].parameters():
+                param.requires_grad_(True)
+
+        if self.restore_adapter is not None:
+            for param in self.restore_adapter.parameters():
+                param.requires_grad_(True)
+
+        logger.info("Token merge route training unfroze transformer layers %s", valid_layers)
 
     def _reduce_image_rotary_emb(
         self,
@@ -666,6 +722,12 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                     num_frames=frame_groups,
                     importance_map=importance_map,
                 )
+                # logger.info(
+                #     "TokenMerge start layer %s: combined_tokens %s -> reduced_tokens %s",
+                #     i,
+                #     list(combined_tokens.shape),
+                #     list(reduced_tokens.shape),
+                # )
                 encoder_hidden_states = reduced_tokens[:, :text_seq_length]
                 hidden_states = reduced_tokens[:, text_seq_length:]
                 rotary_emb_current = self._reduce_image_rotary_emb(base_image_rotary_emb, active_route_info)
@@ -706,6 +768,12 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                             active_route_info, text_seq_length, restored_tokens.device
                         )
                         restored_tokens = adapter(restored_tokens, restore_mask)
+                logger.info(
+                    "TokenMerge end layer %s: combined_tokens %s -> restored_tokens %s",
+                    i,
+                    list(combined_tokens.shape),
+                    list(restored_tokens.shape),
+                )
 
                 encoder_hidden_states = restored_tokens[:, :text_seq_length]
                 hidden_states = restored_tokens[:, text_seq_length:]

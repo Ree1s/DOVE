@@ -5,20 +5,15 @@ export TOKENIZERS_PARALLELISM=false
 
 # Model Configuration
 MODEL_ARGS=(
-    --model_path "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/pretrained_models/DOVE/"
-    --model_name "dove-s2"
-    --model_type "real-sr-image-video"
+    --model_path "THUDM/CogVideoX1.5-5B"
+    --model_name "dove-s1"
+    --model_type "real-sr"
     --training_type "sft"
 )
 
-# LORA_ARGS=(
-#     --rank 64
-#     --lora_alpha 64
-# )
-
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema/"
+    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s1-token-merge"
     --report_to "wandb"
 )
 
@@ -26,25 +21,21 @@ OUTPUT_ARGS=(
 DATA_ARGS=(
     --data_root "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/HQ-VSR"
     --video_column "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/HQ-VSR.txt"
-    --image_data_root "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/DIV2K_train_HR"
-    --image_column "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/DIV2K_train_HR.txt"
-    --train_resolution "2x320x640"  # (frames x height x width), frames should be 8N+1
-    # --crop_mode "resize_random_crop"
-    --image_ratio 0.8
+    --train_resolution "25x320x640"
 )
 
 # Training Configuration
 TRAIN_ARGS=(
-    --train_epochs 10 # number of training epochs
-    --train_steps 500
-    --seed 42 # random seed
+    --train_epochs 1000
+    --train_steps 10000
+    --seed 42
     --batch_size 2
     --gradient_accumulation_steps 1
-    --mixed_precision "bf16"  # ["no", "fp16"] # Only CogVideoX-2B supports fp16 training
-    --learning_rate 5e-6
+    --mixed_precision "bf16"
+    --learning_rate 2e-5
     --gradient_checkpointing true
     --max_grad_norm 0.1
-    --lr_scheduler "constant_with_warmup"  # ["constant_with_warmup", "decay_with_warmup"]
+    --lr_scheduler "constant_with_warmup"
 )
 
 # System Configuration
@@ -52,28 +43,27 @@ SYSTEM_ARGS=(
     --num_workers 0
     --pin_memory True
     --nccl_timeout 1800
-    --stastic_frequency 100
+    --stastic_frequency 500
 )
 
 # Checkpointing Configuration
 CHECKPOINT_ARGS=(
-    --checkpointing_steps 100 # save checkpoint every x steps
-    --checkpointing_limit 3 # maximum number of checkpoints to keep, after which the oldest one is deleted
-    # --resume_from_checkpoint "/absolute/path/to/checkpoint_dir"  # if you want to resume from a checkpoint, otherwise, comment this line
+    --checkpointing_steps 1000
+    --checkpointing_limit 3
+    --resume_from_checkpoint "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s1-token-merge/checkpoint-6000"
 )
 
 # Validation Configuration
 VALIDATION_ARGS=(
-    --do_validation true  # ["true", "false"]
-    --validation_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/UDM10"
-    --validation_steps 100  # should be multiple of checkpointing_steps
+    --do_validation true
+    --validation_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/UDM10/"
+    --validation_steps 500
     --validation_videos "LQ-Video.txt"
     --validation_ref_videos "GT-Video.txt"
-    # --validation_prompts "prompts.txt"
     --gen_fps 8
     --raw_test true
     --num_inference_steps 1
-    --eval_metric_list "psnr,ssim,lpips,dists,clipiqa"  # ["psnr", "ssim", "lpips", "dists", "clipiqa", "musiq", "maniqa", 'niqe']
+    --eval_metric_list "psnr,ssim,lpips,dists,clipiqa"
 )
 
 # SR parameters
@@ -84,17 +74,10 @@ SR_ARGS=(
     --prompt_cache "prompt_embeddings"
     --sr_noise_step 399
     --noise_step 0
-    --degradation_config "/home/sig95vg/codes/DOVE/finetune/configs/degradation_image_video.yaml"
+    --degradation_config "/home/sig95vg/codes/DOVE/finetune/configs/degradation.yaml"
 )
 
-# Perceptual Loss parameters
-Per_ARGS=(
-    --use_perceptual_loss true
-    --dists_weight 1.0
-    --frame_diff_weight 1.0
-)
-
-# Token Merge parameters (enabled by default; adjust as needed)
+# Token Merge parameters
 TOKEN_MERGE_WINDOW_SIZE=${TOKEN_MERGE_WINDOW_SIZE:-0}
 TOKEN_MERGE_WINDOW_STRIDE=${TOKEN_MERGE_WINDOW_STRIDE:-1}
 TOKEN_MERGE_ARGS=(
@@ -117,7 +100,6 @@ fi
 # Resolve script directory for config reference
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Combine all arguments and launch training with token merge
 accelerate launch --config_file "${SCRIPT_DIR}/accelerate_config.yaml" "${SCRIPT_DIR}/train.py" \
     "${MODEL_ARGS[@]}" \
     "${LORA_ARGS[@]}" \
@@ -128,5 +110,4 @@ accelerate launch --config_file "${SCRIPT_DIR}/accelerate_config.yaml" "${SCRIPT
     "${CHECKPOINT_ARGS[@]}" \
     "${VALIDATION_ARGS[@]}" \
     "${SR_ARGS[@]}" \
-    "${Per_ARGS[@]}" \
     "${TOKEN_MERGE_ARGS[@]}"

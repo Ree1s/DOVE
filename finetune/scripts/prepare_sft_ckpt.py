@@ -8,7 +8,7 @@ from pathlib import Path
 def run_zero_to_fp32(checkpoint_dir, output_dir):
     print("Running zero_to_fp32.py with --safe_serialization...")
     subprocess.run([
-        "python3", "scripts/zero_to_fp32.py",
+        "python3", "finetune/scripts/zero_to_fp32.py",
         checkpoint_dir,
         output_dir,
         "--safe_serialization"
@@ -72,7 +72,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint_dir", required=True, help="Input checkpoint folder (e.g., path/checkpoint-12)")
     parser.add_argument("--mid_output_dir", default="", help="Path to store merged FP32 weights")
-    parser.add_argument("--weights_source", default=os.path.expanduser("../../pretrained_models/CogVideoX1.5-5B"),
+    parser.add_argument("--weights_source", default=os.path.expanduser("/data/42-julia-hpc-rz-cv/sig95vg/DOVE/pretrained_models/DOVE"),
                         help="Path to original CogVideo weights")
     parser.add_argument("--ckpt_output_dir", default="",
                         help="Path to final output ckpt directory")
