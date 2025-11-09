@@ -7,8 +7,8 @@
 #SBATCH --tmp=20G                 # Local scratch space
 #SBATCH --mail-type=ALL           # Job begin/end/fail notifications
 #SBATCH --mail-user=sicheng.gao@uni-wuerzburg.de
-#SBATCH --output=logs/dove_s2_temporalmerge_learnable_otherfrozen_lr5e-6_slidewindow3_1_woema_%j.out
-#SBATCH --error=logs/dove_s2_temporamerge_learnable_otherfrozen_lr5e-6_slidewindow3_1_woema_%j.err
+#SBATCH --output=logs/dove_s2_temporalmerge_learnable_otherfrozen_lr5e-6_slidewindow3_1_woema_kd_%j.out
+#SBATCH --error=logs/dove_s2_temporamerge_learnable_otherfrozen_lr5e-6_slidewindow3_1_woema_kd_%j.err
 
 set -euo pipefail
 
@@ -38,6 +38,12 @@ export TOKEN_MERGE_SEED=${TOKEN_MERGE_SEED:-42}
 export TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION=${TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION:-2}
 export TOKEN_MERGE_WINDOW_SIZE=${TOKEN_MERGE_WINDOW_SIZE:-3}
 export TOKEN_MERGE_WINDOW_STRIDE=${TOKEN_MERGE_WINDOW_STRIDE:-1}
+
+# Relational KD defaults (can be overridden before submission)
+export ENABLE_RELATIONAL_KD=${ENABLE_RELATIONAL_KD:-false}
+export TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/data/42-julia-hpc-rz-cv/sig95vg/DOVE/pretrained_models/DOVE/}
+export RELATIONAL_KD_WEIGHT=${RELATIONAL_KD_WEIGHT:-0.1}
+export RELATIONAL_KD_LAYERS=${RELATIONAL_KD_LAYERS:-}
 
 bash ./train_ddp_one_s2_token_merge.sh
 

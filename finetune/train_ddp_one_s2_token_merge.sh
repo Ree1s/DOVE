@@ -3,6 +3,19 @@
 # Prevent tokenizer parallelism issues
 export TOKENIZERS_PARALLELISM=false
 
+# Default hyperparameters (mirrors HPC launcher so this script is self-contained)
+TOKEN_MERGE_ROUTES="${TOKEN_MERGE_ROUTES:-10-17@0.36;28-35@0.36}"
+TOKEN_MERGE_DEFAULT_RATIO="${TOKEN_MERGE_DEFAULT_RATIO:-}"
+TOKEN_MERGE_SEED="${TOKEN_MERGE_SEED:-42}"
+TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION="${TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION:-2}"
+TOKEN_MERGE_WINDOW_SIZE="${TOKEN_MERGE_WINDOW_SIZE:-3}"
+TOKEN_MERGE_WINDOW_STRIDE="${TOKEN_MERGE_WINDOW_STRIDE:-1}"
+
+ENABLE_RELATIONAL_KD="${ENABLE_RELATIONAL_KD:-true}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/data/42-julia-hpc-rz-cv/sig95vg/DOVE/pretrained_models/DOVE/}"
+RELATIONAL_KD_WEIGHT="${RELATIONAL_KD_WEIGHT:-0.25}"
+RELATIONAL_KD_LAYERS="${RELATIONAL_KD_LAYERS:-}"
+
 # Model Configuration
 MODEL_ARGS=(
     --model_path "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/pretrained_models/DOVE/"
@@ -18,7 +31,7 @@ MODEL_ARGS=(
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema/"
+    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/"
     --report_to "wandb"
 )
 
@@ -36,12 +49,12 @@ DATA_ARGS=(
 # Training Configuration
 TRAIN_ARGS=(
     --train_epochs 10 # number of training epochs
-    --train_steps 500
+    --train_steps 1500
     --seed 42 # random seed
-    --batch_size 2
-    --gradient_accumulation_steps 1
+    --batch_size 1
+    --gradient_accumulation_steps 4
     --mixed_precision "bf16"  # ["no", "fp16"] # Only CogVideoX-2B supports fp16 training
-    --learning_rate 5e-6
+    --learning_rate 3e-6
     --gradient_checkpointing true
     --max_grad_norm 0.1
     --lr_scheduler "constant_with_warmup"  # ["constant_with_warmup", "decay_with_warmup"]
@@ -59,14 +72,14 @@ SYSTEM_ARGS=(
 CHECKPOINT_ARGS=(
     --checkpointing_steps 100 # save checkpoint every x steps
     --checkpointing_limit 3 # maximum number of checkpoints to keep, after which the oldest one is deleted
-    # --resume_from_checkpoint "/absolute/path/to/checkpoint_dir"  # if you want to resume from a checkpoint, otherwise, comment this line
+    --resume_from_checkpoint "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/checkpoint-1300"  # if you want to resume from a checkpoint, otherwise, comment this line
 )
 
 # Validation Configuration
 VALIDATION_ARGS=(
     --do_validation true  # ["true", "false"]
     --validation_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/UDM10"
-    --validation_steps 100  # should be multiple of checkpointing_steps
+    --validation_steps 300  # should be multiple of checkpointing_steps
     --validation_videos "LQ-Video.txt"
     --validation_ref_videos "GT-Video.txt"
     # --validation_prompts "prompts.txt"
@@ -95,22 +108,32 @@ Per_ARGS=(
 )
 
 # Token Merge parameters (enabled by default; adjust as needed)
-TOKEN_MERGE_WINDOW_SIZE=${TOKEN_MERGE_WINDOW_SIZE:-0}
-TOKEN_MERGE_WINDOW_STRIDE=${TOKEN_MERGE_WINDOW_STRIDE:-1}
 TOKEN_MERGE_ARGS=(
     --enable_token_merge true
-    --token_merge_seed "${TOKEN_MERGE_SEED:-42}"
-    --token_merge_restore_adapter_expansion "${TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION:-2}"
+    --token_merge_seed "${TOKEN_MERGE_SEED}"
+    --token_merge_restore_adapter_expansion "${TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION}"
     --token_merge_freeze_routes_only true
     --token_merge_window_size "${TOKEN_MERGE_WINDOW_SIZE}"
     --token_merge_window_stride "${TOKEN_MERGE_WINDOW_STRIDE}"
 )
 
-if [[ -n "${TOKEN_MERGE_ROUTES:-}" ]]; then
+if [[ -n "${TOKEN_MERGE_ROUTES}" ]]; then
     TOKEN_MERGE_ARGS+=(--token_merge_routes "${TOKEN_MERGE_ROUTES}")
 fi
 
-if [[ -n "${TOKEN_MERGE_DEFAULT_RATIO:-}" ]]; then
+# Relational KD parameters (optional)
+KD_ARGS=(
+    --enable_relational_kd "${ENABLE_RELATIONAL_KD}"
+    --relational_kd_weight "${RELATIONAL_KD_WEIGHT}"
+)
+if [[ -n "${TEACHER_MODEL_PATH}" ]]; then
+    KD_ARGS+=(--teacher_model_path "${TEACHER_MODEL_PATH}")
+fi
+if [[ -n "${RELATIONAL_KD_LAYERS}" ]]; then
+    KD_ARGS+=(--relational_kd_layers "${RELATIONAL_KD_LAYERS}")
+fi
+
+if [[ -n "${TOKEN_MERGE_DEFAULT_RATIO}" ]]; then
     TOKEN_MERGE_ARGS+=(--token_merge_default_ratio "${TOKEN_MERGE_DEFAULT_RATIO}")
 fi
 
@@ -129,4 +152,5 @@ accelerate launch --config_file "${SCRIPT_DIR}/accelerate_config.yaml" "${SCRIPT
     "${VALIDATION_ARGS[@]}" \
     "${SR_ARGS[@]}" \
     "${Per_ARGS[@]}" \
-    "${TOKEN_MERGE_ARGS[@]}"
+    "${TOKEN_MERGE_ARGS[@]}" \
+    "${KD_ARGS[@]}"

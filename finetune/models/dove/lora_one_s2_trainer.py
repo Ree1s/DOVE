@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 
 class DOVES2Trainer(Trainer):
     UNLOAD_LIST = ["text_encoder", "vae"]
+
+    def __init__(self, args) -> None:
+        self.teacher_transformer = None
+        self._teacher_hooks: List[Any] = []
+        self._teacher_hidden_states: Dict[int, torch.Tensor] = {}
+        self._distillation_layer_ids: set[int] = set()
+        super().__init__(args)
+        if self.args.enable_relational_kd and self.args.relational_kd_weight > 0:
+            self._initialize_distillation_layers()
+            self._init_teacher_model()
 
     @override
     def load_components(self) -> Components:
@@ -92,6 +102,87 @@ class DOVES2Trainer(Trainer):
         )
 
         return components
+
+    def _initialize_distillation_layers(self) -> None:
+        layer_ids: set[int] = set()
+        if self.args.relational_kd_layers:
+            for part in self.args.relational_kd_layers.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    start_str, end_str = part.split("-", 1)
+                    start = int(start_str)
+                    end = int(end_str)
+                    if end < start:
+                        start, end = end, start
+                    layer_ids.update(range(start, end + 1))
+                else:
+                    layer_ids.add(int(part))
+        elif hasattr(self.components.transformer, "_routes"):
+            for route in getattr(self.components.transformer, "_routes", []):
+                start = route.get("start_layer", 0)
+                end = route.get("end_layer", start)
+                layer_ids.update(range(start, end + 1))
+        self._distillation_layer_ids = layer_ids
+
+    def _init_teacher_model(self) -> None:
+        teacher_path = self.args.teacher_model_path or self.args.model_path
+        logger.info("Loading teacher transformer from %s", teacher_path)
+        transformer = CogVideoXTransformer3DModel.from_pretrained(str(teacher_path), subfolder="transformer")
+        transformer.requires_grad_(False)
+        transformer.eval()
+        transformer.to(self.accelerator.device, dtype=self.state.weight_dtype)
+        transformer.gradient_checkpointing = False
+        self.teacher_transformer = transformer
+        self._teacher_hidden_states = {}
+        self._teacher_hooks = []
+        for idx, block in enumerate(self.teacher_transformer.transformer_blocks):
+            hook = block.register_forward_hook(self._build_teacher_hook(idx))
+            self._teacher_hooks.append(hook)
+
+    def _build_teacher_hook(self, index: int):
+        def hook(module, inputs, outputs):
+            if self._distillation_layer_ids and index not in self._distillation_layer_ids:
+                return
+            hidden_states = outputs[0]
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            self._teacher_hidden_states[index] = hidden_states.detach().to(
+                device=self.accelerator.device, dtype=self.state.weight_dtype
+            )
+        return hook
+
+    def _gather_teacher_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        prompt_embedding: torch.Tensor,
+        timesteps: torch.Tensor,
+        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Dict[int, torch.Tensor]:
+        if self.teacher_transformer is None:
+            return {}
+        self._teacher_hidden_states = {}
+        with torch.no_grad():
+            _ = self.teacher_transformer(
+                hidden_states=hidden_states,
+                encoder_hidden_states=prompt_embedding,
+                timestep=timesteps,
+                image_rotary_emb=rotary_emb,
+                return_dict=False,
+            )
+        if not self._teacher_hidden_states:
+            return {}
+        if self._distillation_layer_ids:
+            result = {
+                idx: tensor
+                for idx, tensor in self._teacher_hidden_states.items()
+                if idx in self._distillation_layer_ids
+            }
+        else:
+            result = dict(self._teacher_hidden_states)
+        self._teacher_hidden_states = {}
+        return result
 
     @override
     def initialize_pipeline(self) -> CogVideoXPipeline:
@@ -244,15 +335,33 @@ class DOVES2Trainer(Trainer):
             else None
         )
 
-        # Predict noise (actual is velocity)
-        predicted_noise = self.components.transformer(
+        teacher_hidden_states = None
+        relational_loss = None
+        if self.args.enable_relational_kd and self.args.relational_kd_weight > 0:
+            teacher_hidden_states = self._gather_teacher_hidden_states(
+                lq_latent,
+                prompt_embedding,
+                timesteps,
+                rotary_emb,
+            )
+            if teacher_hidden_states is not None and len(teacher_hidden_states) == 0:
+                teacher_hidden_states = None
+
+        transformer_outputs = self.components.transformer(
             hidden_states=lq_latent,
             encoder_hidden_states=prompt_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
             return_dict=False,
-        )[0]
-        
+            teacher_hidden_states=teacher_hidden_states,
+        )
+        if isinstance(transformer_outputs, tuple):
+            predicted_noise = transformer_outputs[0]
+            if len(transformer_outputs) > 1:
+                relational_loss = transformer_outputs[1]
+        else:
+            predicted_noise = transformer_outputs
+
         # Denoise: x0 (x0' = αt x_t - σt * vθ(z_t))
         latent_pred = self.components.scheduler.get_velocity(
             predicted_noise, lq_latent, timesteps
@@ -327,6 +436,14 @@ class DOVES2Trainer(Trainer):
             frame_diff_loss = torch.tensor(0.0, device=self.accelerator.device)
 
         loss = mse_loss + perceptual_loss + frame_diff_loss
+        if relational_loss is not None and self.args.enable_relational_kd and self.args.relational_kd_weight > 0:
+            kd_loss = relational_loss.to(dtype=loss.dtype) * self.args.relational_kd_weight
+            loss = loss + kd_loss
+            loss_dict['relational_kd_loss'] = kd_loss.detach().item()
+            loss_dict['relational_kd_raw'] = relational_loss.detach().item()
+        else:
+            loss_dict['relational_kd_loss'] = 0.0
+            loss_dict['relational_kd_raw'] = 0.0
 
         loss_dict['perceptual_loss'] = perceptual_loss.detach().item() # original loss
         loss_dict['mse_loss'] = mse_loss.detach().item()

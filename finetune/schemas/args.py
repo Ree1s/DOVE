@@ -131,6 +131,12 @@ class Args(BaseModel):
     lpips_weight: float = 0.0
     frame_diff_weight: float = 0.0
 
+    ########## Distillation ##########
+    enable_relational_kd: bool = False
+    relational_kd_weight: float = 0.0
+    teacher_model_path: Path | None = None
+    relational_kd_layers: str | None = None
+
 
     @field_validator("image_column")
     def validate_image_column(cls, v: str | None, info: ValidationInfo) -> str | None:
@@ -222,6 +228,14 @@ class Args(BaseModel):
         window_size = values.get("token_merge_window_size", 0)
         if window_size > 0 and v <= 0:
             raise ValueError("token_merge_window_stride must be > 0 when windowing is enabled")
+        return v
+
+    @field_validator("teacher_model_path")
+    def validate_teacher_model(cls, v: Path | None, info: ValidationInfo) -> Path | None:
+        values = info.data
+        if values.get("enable_relational_kd"):
+            if v is None:
+                raise ValueError("teacher_model_path must be provided when enable_relational_kd is True")
         return v
 
     @field_validator("train_resolution")
@@ -418,6 +432,12 @@ class Args(BaseModel):
         parser.add_argument("--ea_lpips_weight", type=float, default=0.0)
         parser.add_argument("--lpips_weight", type=float, default=0.0)
         parser.add_argument("--frame_diff_weight", type=float, default=0.0)
+
+        # Distillation parameters
+        parser.add_argument("--enable_relational_kd", type=lambda x: x.lower() == 'true', default=False)
+        parser.add_argument("--relational_kd_weight", type=float, default=0.0)
+        parser.add_argument("--teacher_model_path", type=str, default=None)
+        parser.add_argument("--relational_kd_layers", type=str, default=None)
 
         args = parser.parse_args()
 

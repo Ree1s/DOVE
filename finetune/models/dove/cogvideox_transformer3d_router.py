@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import PeftAdapterMixin
@@ -477,6 +478,17 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             return max(1, num_frames)
         return max(1, num_frames // patch_size_t)
 
+    def _compute_gram_matrix(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the Gram matrix for a batch of features.
+        Input shape: (B, N, C)
+        Output shape: (B, C, C)
+        """
+        B, N, C = features.shape
+        features_reshaped = features.permute(0, 2, 1)
+        gram = torch.bmm(features_reshaped, features_reshaped.transpose(1, 2)) / (N * C)
+        return gram
+
     def _configure_token_merge(
         self,
         enable_token_merge: bool,
@@ -649,6 +661,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
+        teacher_hidden_states: Optional[Dict[int, torch.Tensor]] = None,
     ):
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -698,6 +711,9 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         active_route_info = None
         base_image_rotary_emb = image_rotary_emb
         rotary_emb_current = image_rotary_emb
+
+        total_relational_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        distillation_loss_applied = False
 
         for i, block in enumerate(self.transformer_blocks):
             if (
@@ -751,6 +767,29 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                 )
 
             if (
+                teacher_hidden_states is not None
+                and i in teacher_hidden_states
+                and active_route_info is not None
+                and getattr(active_route_info, "keep_idx", None) is not None
+            ):
+                h_S_pruned = hidden_states
+                h_T_full = teacher_hidden_states[i].to(h_S_pruned.device, dtype=h_S_pruned.dtype)
+
+                h_T_subset_list: List[torch.Tensor] = []
+                B = h_T_full.shape[0]
+                for b_idx in range(B):
+                    keep_indices_b = active_route_info.keep_idx[b_idx].to(h_T_full.device)
+                    h_T_subset_list.append(h_T_full[b_idx, keep_indices_b])
+
+                if h_T_subset_list:
+                    h_T_subset = torch.stack(h_T_subset_list, dim=0)
+                    gram_S = self._compute_gram_matrix(h_S_pruned)
+                    gram_T = self._compute_gram_matrix(h_T_subset.detach())
+                    layer_loss = F.mse_loss(gram_S, gram_T)
+                    total_relational_loss = total_relational_loss + layer_loss.to(total_relational_loss.dtype)
+                    distillation_loss_applied = True
+
+            if (
                 self.enable_token_merge
                 and self.router is not None
                 and active_route_info is not None
@@ -768,12 +807,12 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                             active_route_info, text_seq_length, restored_tokens.device
                         )
                         restored_tokens = adapter(restored_tokens, restore_mask)
-                logger.info(
-                    "TokenMerge end layer %s: combined_tokens %s -> restored_tokens %s",
-                    i,
-                    list(combined_tokens.shape),
-                    list(restored_tokens.shape),
-                )
+                # logger.info(
+                #     "TokenMerge end layer %s: combined_tokens %s -> restored_tokens %s",
+                #     i,
+                #     list(combined_tokens.shape),
+                #     list(restored_tokens.shape),
+                # )
 
                 encoder_hidden_states = restored_tokens[:, :text_seq_length]
                 hidden_states = restored_tokens[:, text_seq_length:]
@@ -805,5 +844,10 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
+            if distillation_loss_applied:
+                return (output, total_relational_loss)
             return (output,)
-        return Transformer2DModelOutput(sample=output)
+        return Transformer2DModelOutput(
+            sample=output,
+            loss=total_relational_loss if distillation_loss_applied else None,
+        )
