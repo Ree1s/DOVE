@@ -1,5 +1,6 @@
 import logging
 from typing import Any, Dict, List, Tuple, Optional
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -40,9 +41,14 @@ class DOVES2Trainer(Trainer):
         self._teacher_hidden_states: Dict[int, torch.Tensor] = {}
         self._distillation_layer_ids: set[int] = set()
         super().__init__(args)
-        if self.args.enable_relational_kd and self.args.relational_kd_weight > 0:
+        self._use_relational_kd = self.args.enable_relational_kd and self.args.relational_kd_weight > 0
+        self._use_teacher_lpips = (
+            self.args.enable_teacher_lpips_kd and self.args.teacher_lpips_weight > 0
+        )
+        if self._use_relational_kd:
             self._initialize_distillation_layers()
-            self._init_teacher_model()
+        if self._use_relational_kd or self._use_teacher_lpips:
+            self._init_teacher_model(register_hooks=self._use_relational_kd)
 
     @override
     def load_components(self) -> Components:
@@ -126,7 +132,7 @@ class DOVES2Trainer(Trainer):
                 layer_ids.update(range(start, end + 1))
         self._distillation_layer_ids = layer_ids
 
-    def _init_teacher_model(self) -> None:
+    def _init_teacher_model(self, register_hooks: bool = True) -> None:
         teacher_path = self.args.teacher_model_path or self.args.model_path
         logger.info("Loading teacher transformer from %s", teacher_path)
         transformer = CogVideoXTransformer3DModel.from_pretrained(str(teacher_path), subfolder="transformer")
@@ -137,9 +143,10 @@ class DOVES2Trainer(Trainer):
         self.teacher_transformer = transformer
         self._teacher_hidden_states = {}
         self._teacher_hooks = []
-        for idx, block in enumerate(self.teacher_transformer.transformer_blocks):
-            hook = block.register_forward_hook(self._build_teacher_hook(idx))
-            self._teacher_hooks.append(hook)
+        if register_hooks:
+            for idx, block in enumerate(self.teacher_transformer.transformer_blocks):
+                hook = block.register_forward_hook(self._build_teacher_hook(idx))
+                self._teacher_hooks.append(hook)
 
     def _build_teacher_hook(self, index: int):
         def hook(module, inputs, outputs):
@@ -153,36 +160,39 @@ class DOVES2Trainer(Trainer):
             )
         return hook
 
-    def _gather_teacher_hidden_states(
+    def _forward_teacher_model(
         self,
         hidden_states: torch.Tensor,
         prompt_embedding: torch.Tensor,
         timesteps: torch.Tensor,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Dict[int, torch.Tensor]:
+        collect_hidden_states: bool = False,
+    ) -> Tuple[Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]]]:
         if self.teacher_transformer is None:
-            return {}
-        self._teacher_hidden_states = {}
+            return None, None
+        if collect_hidden_states:
+            self._teacher_hidden_states = {}
         with torch.no_grad():
-            _ = self.teacher_transformer(
+            outputs = self.teacher_transformer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=prompt_embedding,
                 timestep=timesteps,
                 image_rotary_emb=rotary_emb,
                 return_dict=False,
             )
-        if not self._teacher_hidden_states:
-            return {}
-        if self._distillation_layer_ids:
-            result = {
-                idx: tensor
-                for idx, tensor in self._teacher_hidden_states.items()
-                if idx in self._distillation_layer_ids
-            }
-        else:
-            result = dict(self._teacher_hidden_states)
+        predicted_noise = outputs[0] if isinstance(outputs, tuple) else outputs
+        teacher_hidden_states: Optional[Dict[int, torch.Tensor]] = None
+        if collect_hidden_states and self._teacher_hidden_states:
+            if self._distillation_layer_ids:
+                teacher_hidden_states = {
+                    idx: tensor
+                    for idx, tensor in self._teacher_hidden_states.items()
+                    if idx in self._distillation_layer_ids
+                }
+            else:
+                teacher_hidden_states = dict(self._teacher_hidden_states)
         self._teacher_hidden_states = {}
-        return result
+        return predicted_noise, teacher_hidden_states
 
     @override
     def initialize_pipeline(self) -> CogVideoXPipeline:
@@ -202,6 +212,28 @@ class DOVES2Trainer(Trainer):
         latent_dist = vae.encode(video).latent_dist
         latent = latent_dist.sample() * vae.config.scaling_factor
         return latent
+
+    def _decode_latents_to_video(
+        self,
+        latent_pred: torch.Tensor,
+        ncopy: int,
+        patch_size_t: Optional[int],
+        enable_grad: bool,
+    ) -> torch.Tensor:
+        decode_ctx = nullcontext() if enable_grad else torch.no_grad()
+        with decode_ctx:
+            if patch_size_t is not None and ncopy > 0:
+                latent_pred = latent_pred[:, ncopy:, :, :, :]
+            latent_pred = latent_pred.permute(0, 2, 1, 3, 4)
+            latent_pred = latent_pred / self.components.vae.config.scaling_factor
+            decoded_frames = []
+            for i in range(latent_pred.shape[2]):
+                latent_frame = latent_pred[:, :, i:i+1, :, :]
+                frame_decoded = self.components.vae.decode(latent_frame).sample
+                decoded_frames.append(frame_decoded)
+            video = torch.cat(decoded_frames, dim=2)
+            video = (video * 0.5 + 0.5).clamp(0.0, 1.0)
+        return video
 
     @override
     def encode_text(self, prompt: str) -> torch.Tensor:
@@ -283,11 +315,13 @@ class DOVES2Trainer(Trainer):
         # Shape of latent: [B, C, F, H, W]
 
         patch_size_t = self.state.transformer_config.patch_size_t
+        ncopy = 0
         if patch_size_t is not None:
             ncopy = lq_latent.shape[2] % patch_size_t
-            # Copy the first frame ncopy times to match patch_size_t
-            lq_first_frame = lq_latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
-            lq_latent = torch.cat([lq_first_frame.repeat(1, 1, ncopy, 1, 1), lq_latent], dim=2)
+            if ncopy > 0:
+                # Copy the first frame ncopy times to match patch_size_t
+                lq_first_frame = lq_latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
+                lq_latent = torch.cat([lq_first_frame.repeat(1, 1, ncopy, 1, 1), lq_latent], dim=2)
 
             assert lq_latent.shape[2] % patch_size_t == 0
 
@@ -336,13 +370,15 @@ class DOVES2Trainer(Trainer):
         )
 
         teacher_hidden_states = None
+        teacher_predicted_noise = None
         relational_loss = None
-        if self.args.enable_relational_kd and self.args.relational_kd_weight > 0:
-            teacher_hidden_states = self._gather_teacher_hidden_states(
+        if self._use_relational_kd or self._use_teacher_lpips:
+            teacher_predicted_noise, teacher_hidden_states = self._forward_teacher_model(
                 lq_latent,
                 prompt_embedding,
                 timesteps,
                 rotary_emb,
+                collect_hidden_states=self._use_relational_kd,
             )
             if teacher_hidden_states is not None and len(teacher_hidden_states) == 0:
                 teacher_hidden_states = None
@@ -367,19 +403,19 @@ class DOVES2Trainer(Trainer):
             predicted_noise, lq_latent, timesteps
         )
 
-        # generate video
-        if patch_size_t is not None and ncopy > 0:
-            latent_pred = latent_pred[:, ncopy:, :, :, :]
-        # from [B, F, C, H, W] to [B, C, F, H, W]
-        latent_pred = latent_pred.permute(0, 2, 1, 3, 4)
-        latent_pred = 1 / self.components.vae.config.scaling_factor * latent_pred
-        decoded_frames = []
-        for i in range(latent_pred.shape[2]):
-            latent_frame = latent_pred[:, :, i:i+1, :, :]
-            frame_decoded = self.components.vae.decode(latent_frame).sample
-            decoded_frames.append(frame_decoded)
-        video_generate = torch.cat(decoded_frames, dim=2)
-        video_generate = (video_generate * 0.5 + 0.5).clamp(0.0, 1.0)
+        video_generate = self._decode_latents_to_video(
+            latent_pred, ncopy=ncopy, patch_size_t=patch_size_t, enable_grad=True
+        )
+
+        teacher_video = None
+        if self._use_teacher_lpips and teacher_predicted_noise is not None:
+            with torch.no_grad():
+                teacher_latent_pred = self.components.scheduler.get_velocity(
+                    teacher_predicted_noise, lq_latent, timesteps
+                )
+                teacher_video = self._decode_latents_to_video(
+                    teacher_latent_pred, ncopy=ncopy, patch_size_t=patch_size_t, enable_grad=False
+                )
 
         # Compute loss
         loss_dict = {}
@@ -436,7 +472,7 @@ class DOVES2Trainer(Trainer):
             frame_diff_loss = torch.tensor(0.0, device=self.accelerator.device)
 
         loss = mse_loss + perceptual_loss + frame_diff_loss
-        if relational_loss is not None and self.args.enable_relational_kd and self.args.relational_kd_weight > 0:
+        if relational_loss is not None and self._use_relational_kd:
             kd_loss = relational_loss.to(dtype=loss.dtype) * self.args.relational_kd_weight
             loss = loss + kd_loss
             loss_dict['relational_kd_loss'] = kd_loss.detach().item()
@@ -444,6 +480,19 @@ class DOVES2Trainer(Trainer):
         else:
             loss_dict['relational_kd_loss'] = 0.0
             loss_dict['relational_kd_raw'] = 0.0
+
+        teacher_lpips_loss = torch.tensor(0.0, device=self.accelerator.device)
+        if teacher_video is not None and self._use_teacher_lpips:
+            for f in range(video_generate.shape[2]):
+                student_frame = video_generate[:, :, f, :, :].to(dtype=torch.float32, device=self.accelerator.device)
+                teacher_frame = teacher_video[:, :, f, :, :].to(dtype=torch.float32, device=self.accelerator.device)
+                teacher_lpips_loss = teacher_lpips_loss + self.lpips_loss(student_frame, teacher_frame)
+            teacher_lpips_loss = teacher_lpips_loss / video_generate.shape[2]
+            teacher_lpips_loss = teacher_lpips_loss * self.args.teacher_lpips_weight
+            loss = loss + teacher_lpips_loss
+            loss_dict['teacher_lpips_loss'] = teacher_lpips_loss.detach().item()
+        else:
+            loss_dict['teacher_lpips_loss'] = 0.0
 
         loss_dict['perceptual_loss'] = perceptual_loss.detach().item() # original loss
         loss_dict['mse_loss'] = mse_loss.detach().item()

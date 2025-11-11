@@ -5,8 +5,8 @@ DOVER_WEIGHTS=/data/42-julia-hpc-rz-cv/sig95vg/checkpoints/DOVER.pth
 # UDM10
 python inference_script_merge.py \
     --input_dir /data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/UDM10/LQ-Video \
-    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.36_otherfrozen_lr5e-6_slidewindow3_1_woema/ckpt-400/-sft \
-    --output_path /home/sig95vg/codes/DOVE/results/DOV_merge/UDM10 \
+    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/ckpt-1500-sft \
+    --output_path /home/sig95vg/codes/DOVE/results/DOV_merge_distillation/UDM10 \
     --is_vae_st \
     --token_merge_routes "10-17@0.36;28-35@0.36" \
     --token_merge_window_size 3 \
@@ -16,26 +16,26 @@ python inference_script_merge.py \
 
 python eval_metrics.py \
     --gt /data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/UDM10/GT \
-    --pred /home/sig95vg/codes/DOVE/results/DOV_merge/UDM10 \
+    --pred /home/sig95vg/codes/DOVE/results/DOV_merge_distillation/UDM10 \
     --metrics psnr,ssim,lpips,dists,clipiqa
 
 # DOVER temporal consistency metric
 python finetune/scripts/eval_dover.py \
-    --pred /home/sig95vg/codes/DOVE/results/DOV_merge/UDM10 \
-    --out /home/sig95vg/codes/DOVE/results/DOV_merge/UDM10 \
+    --pred /home/sig95vg/codes/DOVE/results/DOV_merge_distillation/UDM10 \
+    --out /home/sig95vg/codes/DOVE/results/DOV_merge_distillation/UDM10 \
     --weights ${DOVER_WEIGHTS}
 
 # Ewarp temporal warping error
 python finetune/scripts/eval_ewarp.py \
-    --pred /home/sig95vg/codes/DOVE/results/DOV_merge/UDM10 \
+    --pred /home/sig95vg/codes/DOVE/results/DOV_merge_distillation/UDM10 \
     --metric warping_error \
     --model /data/42-julia-hpc-rz-cv/sig95vg/checkpoints/raft-things.pth \
-    --out /home/sig95vg/codes/DOVE/results/DOV_merge/UDM10
+    --out /home/sig95vg/codes/DOVE/results/DOV_merge_distillation/UDM10
 
 # SPMCS
 python inference_script_merge.py \
     --input_dir /data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/SPMCS/LQ-Video \
-    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.36_otherfrozen_lr5e-6_slidewindow3_1_woema/ckpt-400/-sft \
+    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/ckpt-1500-sft \
     --output_path /home/sig95vg/codes/DOVE/results/DOV_merge/SPMCS \
     --is_vae_st \
     --token_merge_routes "10-17@0.36;28-35@0.36" \
@@ -65,7 +65,7 @@ python finetune/scripts/eval_ewarp.py \
 # YouHQ40
 python inference_script_merge.py \
     --input_dir /data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/YouHQ40/LQ-Video \
-    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.36_otherfrozen_lr5e-6_slidewindow3_1_woema/ckpt-400/-sft \
+    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/ckpt-1500-sft \
     --output_path /home/sig95vg/codes/DOVE/results/DOV_merge/YouHQ40 \
     --is_vae_st \
     --token_merge_routes "10-17@0.36;28-35@0.36" \
@@ -95,7 +95,7 @@ python finetune/scripts/eval_ewarp.py \
 # RealVSR
 python inference_script_merge.py \
     --input_dir /data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/RealVSR/LQ-Video \
-    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.36_otherfrozen_lr5e-6_slidewindow3_1_woema/ckpt-400/-sft \
+    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/ckpt-1500-sft \
     --output_path /home/sig95vg/codes/DOVE/results/DOV_merge/RealVSR \
     --is_vae_st \
     --upscale 1 \
@@ -126,7 +126,7 @@ python finetune/scripts/eval_ewarp.py \
 # MVSR4x
 python inference_script_merge.py \
     --input_dir /data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/MVSR4x/LQ-Video \
-    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.36_otherfrozen_lr5e-6_slidewindow3_1_woema/ckpt-400/-sft \
+    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/ckpt-1500-sft \
     --output_path /home/sig95vg/codes/DOVE/results/DOV_merge/MVSR4x \
     --is_vae_st \
     --upscale 1 \
@@ -157,7 +157,7 @@ python finetune/scripts/eval_ewarp.py \
 # VideoLQ
 python inference_script_merge.py \
     --input_dir /data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/VideoLQ/LQ-Video \
-    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.36_otherfrozen_lr5e-6_slidewindow3_1_woema/ckpt-400/-sft \
+    --model_path /data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_10_17_28_35_ratio0.64_lr5e-6_slidewindow3_1_woema_kd_1500iterations/ckpt-1500-sft \
     --output_path /home/sig95vg/codes/DOVE/results/DOV_merge/VideoLQ \
     --is_vae_st \
     --token_merge_routes "10-17@0.36;28-35@0.36" \

@@ -440,6 +440,9 @@ class Trainer:
                 self.lpips_loss = pyiqa.create_metric('lpips', device=self.accelerator.device, as_loss=True)
             elif self.args.lpips_weight > 0:
                 self.lpips_loss = pyiqa.create_metric('lpips', device=self.accelerator.device, as_loss=True)
+        if getattr(self.args, "enable_teacher_lpips_kd", False) and self.args.teacher_lpips_weight > 0:
+            if not hasattr(self, "lpips_loss"):
+                self.lpips_loss = pyiqa.create_metric('lpips', device=self.accelerator.device, as_loss=True)
         
         if self.args.use_optical_flow:
             self.raft = RAFT_bi("./utils/RAFT/raft-things.pth", device=self.accelerator.device)

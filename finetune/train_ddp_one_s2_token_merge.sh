@@ -11,10 +11,12 @@ TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION="${TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION:-
 TOKEN_MERGE_WINDOW_SIZE="${TOKEN_MERGE_WINDOW_SIZE:-3}"
 TOKEN_MERGE_WINDOW_STRIDE="${TOKEN_MERGE_WINDOW_STRIDE:-1}"
 
-ENABLE_RELATIONAL_KD="${ENABLE_RELATIONAL_KD:-true}"
+ENABLE_RELATIONAL_KD="${ENABLE_RELATIONAL_KD:-false}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/data/42-julia-hpc-rz-cv/sig95vg/DOVE/pretrained_models/DOVE/}"
 RELATIONAL_KD_WEIGHT="${RELATIONAL_KD_WEIGHT:-0.25}"
 RELATIONAL_KD_LAYERS="${RELATIONAL_KD_LAYERS:-}"
+ENABLE_TEACHER_LPIPS_KD="${ENABLE_TEACHER_LPIPS_KD:-true}"
+TEACHER_LPIPS_WEIGHT="${TEACHER_LPIPS_WEIGHT:-0.2}"
 
 # Model Configuration
 MODEL_ARGS=(
@@ -49,10 +51,10 @@ DATA_ARGS=(
 # Training Configuration
 TRAIN_ARGS=(
     --train_epochs 10 # number of training epochs
-    --train_steps 1500
+    --train_steps 1000
     --seed 42 # random seed
-    --batch_size 1
-    --gradient_accumulation_steps 4
+    --batch_size 2
+    --gradient_accumulation_steps 1
     --mixed_precision "bf16"  # ["no", "fp16"] # Only CogVideoX-2B supports fp16 training
     --learning_rate 3e-6
     --gradient_checkpointing true
@@ -125,6 +127,8 @@ fi
 KD_ARGS=(
     --enable_relational_kd "${ENABLE_RELATIONAL_KD}"
     --relational_kd_weight "${RELATIONAL_KD_WEIGHT}"
+    --enable_teacher_lpips_kd "${ENABLE_TEACHER_LPIPS_KD}"
+    --teacher_lpips_weight "${TEACHER_LPIPS_WEIGHT}"
 )
 if [[ -n "${TEACHER_MODEL_PATH}" ]]; then
     KD_ARGS+=(--teacher_model_path "${TEACHER_MODEL_PATH}")

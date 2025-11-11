@@ -136,6 +136,8 @@ class Args(BaseModel):
     relational_kd_weight: float = 0.0
     teacher_model_path: Path | None = None
     relational_kd_layers: str | None = None
+    enable_teacher_lpips_kd: bool = False
+    teacher_lpips_weight: float = 0.0
 
 
     @field_validator("image_column")
@@ -233,9 +235,11 @@ class Args(BaseModel):
     @field_validator("teacher_model_path")
     def validate_teacher_model(cls, v: Path | None, info: ValidationInfo) -> Path | None:
         values = info.data
-        if values.get("enable_relational_kd"):
+        if values.get("enable_relational_kd") or values.get("enable_teacher_lpips_kd"):
             if v is None:
-                raise ValueError("teacher_model_path must be provided when enable_relational_kd is True")
+                raise ValueError(
+                    "teacher_model_path must be provided when teacher-guided distillation is enabled"
+                )
         return v
 
     @field_validator("train_resolution")
@@ -438,6 +442,8 @@ class Args(BaseModel):
         parser.add_argument("--relational_kd_weight", type=float, default=0.0)
         parser.add_argument("--teacher_model_path", type=str, default=None)
         parser.add_argument("--relational_kd_layers", type=str, default=None)
+        parser.add_argument("--enable_teacher_lpips_kd", type=lambda x: x.lower() == 'true', default=False)
+        parser.add_argument("--teacher_lpips_weight", type=float, default=0.0)
 
         args = parser.parse_args()
 
