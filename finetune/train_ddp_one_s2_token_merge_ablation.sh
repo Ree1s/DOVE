@@ -4,7 +4,8 @@
 export TOKENIZERS_PARALLELISM=false
 
 # Default hyperparameters (mirrors HPC launcher so this script is self-contained)
-TOKEN_MERGE_ROUTES="${TOKEN_MERGE_ROUTES:-11-18@0.36;28-35@0.36}"
+# Updated routes based on layer ablation: focus on tolerant mid-late blocks, avoid fragile ends.
+TOKEN_MERGE_ROUTES="${TOKEN_MERGE_ROUTES:-26-34@0.34;22-25@0.18}"
 TOKEN_MERGE_DEFAULT_RATIO="${TOKEN_MERGE_DEFAULT_RATIO:-}"
 TOKEN_MERGE_SEED="${TOKEN_MERGE_SEED:-42}"
 TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION="${TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION:-2}"
@@ -36,7 +37,7 @@ MODEL_ARGS=(
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_learnable_11_18_28_35_dynamicratio0.2_lr5e-6_slidewindow3_1_woema/"
+    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2-temporal_merge_ablation_routes_22_25_26_34_lr5e-6_slidewindow3_1_woema/"
     --report_to "wandb"
 )
 

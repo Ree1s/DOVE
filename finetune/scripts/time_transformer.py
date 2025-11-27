@@ -98,6 +98,9 @@ def load_token_merge(base_transformer, args):
         restore_adapter_expansion=args.token_merge_restore_adapter_expansion,
         window_size=args.token_merge_window_size,
         window_stride=args.token_merge_window_stride,
+        ratio_start=args.token_merge_ratio_start,
+        ratio_warmup_steps=args.token_merge_ratio_warmup_steps,
+        ratio_schedule=args.token_merge_ratio_schedule,
     )
     if args.token_merge_freeze_routes_only:
         tm_transformer.freeze_parameters_to_routes()
@@ -120,6 +123,9 @@ def parse_args():
     parser.add_argument("--token_merge_restore_adapter_expansion", type=int, default=2)
     parser.add_argument("--token_merge_window_size", type=int, default=0)
     parser.add_argument("--token_merge_window_stride", type=int, default=1)
+    parser.add_argument("--token_merge_ratio_start", type=float, default=None)
+    parser.add_argument("--token_merge_ratio_warmup_steps", type=int, default=0)
+    parser.add_argument("--token_merge_ratio_schedule", type=str, default="linear", choices=["linear", "cosine"])
     parser.add_argument("--token_merge_freeze_routes_only", action="store_true")
 
     return parser.parse_args()

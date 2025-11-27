@@ -80,6 +80,9 @@ SR_ARGS=(
 # Token Merge parameters
 TOKEN_MERGE_WINDOW_SIZE=${TOKEN_MERGE_WINDOW_SIZE:-0}
 TOKEN_MERGE_WINDOW_STRIDE=${TOKEN_MERGE_WINDOW_STRIDE:-1}
+TOKEN_MERGE_RATIO_START=${TOKEN_MERGE_RATIO_START:-}
+TOKEN_MERGE_RATIO_WARMUP_STEPS=${TOKEN_MERGE_RATIO_WARMUP_STEPS:-0}
+TOKEN_MERGE_RATIO_SCHEDULE=${TOKEN_MERGE_RATIO_SCHEDULE:-linear}
 TOKEN_MERGE_ARGS=(
     --enable_token_merge true
     --token_merge_seed "${TOKEN_MERGE_SEED:-42}"
@@ -87,6 +90,8 @@ TOKEN_MERGE_ARGS=(
     --token_merge_freeze_routes_only true
     --token_merge_window_size "${TOKEN_MERGE_WINDOW_SIZE}"
     --token_merge_window_stride "${TOKEN_MERGE_WINDOW_STRIDE}"
+    --token_merge_ratio_warmup_steps "${TOKEN_MERGE_RATIO_WARMUP_STEPS}"
+    --token_merge_ratio_schedule "${TOKEN_MERGE_RATIO_SCHEDULE}"
 )
 
 if [[ -n "${TOKEN_MERGE_ROUTES:-}" ]]; then
@@ -95,6 +100,10 @@ fi
 
 if [[ -n "${TOKEN_MERGE_DEFAULT_RATIO:-}" ]]; then
     TOKEN_MERGE_ARGS+=(--token_merge_default_ratio "${TOKEN_MERGE_DEFAULT_RATIO}")
+fi
+
+if [[ -n "${TOKEN_MERGE_RATIO_START:-}" ]]; then
+    TOKEN_MERGE_ARGS+=(--token_merge_ratio_start "${TOKEN_MERGE_RATIO_START}")
 fi
 
 # Resolve script directory for config reference

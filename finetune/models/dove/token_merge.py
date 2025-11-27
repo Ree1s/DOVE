@@ -492,17 +492,37 @@ def parse_token_merge_routes(spec: Optional[str]) -> List[Dict[str, float]]:
         try:
             layer_span, ratio_str = chunk.split("@", maxsplit=1)
             start_str, end_str = layer_span.split("-", maxsplit=1)
+            ratio_part = ratio_str.strip()
+            ratio_start = None
+            ratio_end = None
+            if "->" in ratio_part:
+                ratio_start_str, ratio_end_str = ratio_part.split("->", maxsplit=1)
+                ratio_start = float(ratio_start_str.strip())
+                ratio_end = float(ratio_end_str.strip())
+            else:
+                ratio_end = float(ratio_part)
             route = {
                 "start_layer": int(start_str.strip()),
                 "end_layer": int(end_str.strip()),
-                "selection_ratio": float(ratio_str.strip()),
+                "selection_ratio": float(ratio_end),
             }
+            if ratio_start is not None:
+                route["ratio_start"] = ratio_start
+            if ratio_end is not None:
+                route["ratio_end"] = ratio_end
         except ValueError as exc:
-            raise ValueError(f"Invalid token-merge route spec '{chunk}'. Expected 'start-end@ratio'.") from exc
+            raise ValueError(
+                f"Invalid token-merge route spec '{chunk}'. Expected 'start-end@ratio' or 'start-end@start->end'."
+            ) from exc
         if route["start_layer"] > route["end_layer"]:
             raise ValueError(f"Route start {route['start_layer']} cannot be greater than end {route['end_layer']}.")
-        if not (0.0 <= route["selection_ratio"] <= 1.0):
-            raise ValueError(f"Route ratio must be in [0,1], got {route['selection_ratio']}.")
+        ratio_vals = [route["selection_ratio"]]
+        if "ratio_start" in route:
+            ratio_vals.append(route["ratio_start"])
+        if "ratio_end" in route:
+            ratio_vals.append(route["ratio_end"])
+        if not all(0.0 <= val <= 1.0 for val in ratio_vals):
+            raise ValueError(f"Route ratio values must be in [0,1], got {ratio_vals}.")
         routes.append(route)
 
     return routes

@@ -508,6 +508,14 @@ class Trainer:
             }
         })
 
+    def _update_token_merge_curriculum(self, global_step: int) -> None:
+        transformer = getattr(self.components, "transformer", None)
+        if transformer is None:
+            return
+        update_fn = getattr(transformer, "update_token_merge_progress", None)
+        if callable(update_fn):
+            update_fn(global_step)
+
     def train(self) -> None:
         logger.info("Starting training")
 
@@ -567,6 +575,8 @@ class Trainer:
 
         free_memory()
 
+        self._update_token_merge_curriculum(initial_global_step)
+
         for epoch in range(first_epoch, self.args.train_epochs):
             logger.debug(f"Starting epoch ({epoch + 1}/{self.args.train_epochs})")
 
@@ -617,6 +627,7 @@ class Trainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    self._update_token_merge_curriculum(global_step)
                     self._update_ema(global_step)
                     self.__maybe_save_checkpoint(global_step)
 

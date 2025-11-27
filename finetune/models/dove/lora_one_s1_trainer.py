@@ -66,6 +66,9 @@ class DOVES1Trainer(Trainer):
                 restore_adapter_expansion=int(self.args.token_merge_restore_adapter_expansion),
                 window_size=int(self.args.token_merge_window_size),
                 window_stride=int(self.args.token_merge_window_stride),
+                ratio_start=self.args.token_merge_ratio_start,
+                ratio_warmup_steps=int(self.args.token_merge_ratio_warmup_steps),
+                ratio_schedule=self.args.token_merge_ratio_schedule,
             )
 
             if not transformer.enable_token_merge:

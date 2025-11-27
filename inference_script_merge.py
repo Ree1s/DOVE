@@ -2,6 +2,7 @@ from pathlib import Path
 import argparse
 import logging
 import time
+import math
 
 import torch
 from torchvision import transforms
@@ -34,6 +35,7 @@ from pathlib import Path
 import pyiqa
 import imageio.v3 as iio
 import glob
+import numpy as np
 
 # Must import after torch because this can sometimes lead to a nasty segmentation fault, or stack smashing error
 # Very few bug reports but it happens. Look in decord Github issues for more relevant information.
@@ -158,11 +160,139 @@ def save_frames_as_png(video, output_dir, fps=8):
     video = video.permute(1, 2, 3, 0)  # [F, H, W, C]
 
     os.makedirs(output_dir, exist_ok=True)
-    frames = (video * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
-    
-    for i, frame in enumerate(frames):
-        filename = os.path.join(output_dir, f"{i:03d}.png")
-        Image.fromarray(frame).save(filename)
+
+
+def _parse_metric_layer_indices(spec: str | None):
+    if not spec:
+        return None
+    indices = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            indices.add(int(part))
+        except ValueError:
+            logging.warning("Skipping invalid metric head layer index: %s", part)
+    return indices or None
+
+
+def _parse_metric_layout(spec: str | None):
+    if not spec:
+        return None
+    parts = [p.strip() for p in spec.replace("x", ",").split(",")]
+    parts = [p for p in parts if p]
+    if len(parts) != 3:
+        logging.warning("Invalid metric_head_layout '%s', expected format F,H,W", spec)
+        return None
+    try:
+        frames, height, width = [int(p) for p in parts]
+        if frames <= 0 or height <= 0 or width <= 0:
+            raise ValueError
+    except ValueError:
+        logging.warning("Invalid metric_head_layout '%s', values must be positive integers", spec)
+        return None
+    return (frames, height, width)
+
+
+def _render_metric_heatmap(values: np.ndarray, output_resolution: int = 512) -> Image.Image:
+    if values.ndim == 1:
+        normalized = values - values.min()
+        max_val = normalized.max()
+        if max_val > 0:
+            normalized = normalized / max_val
+        width = int(math.ceil(math.sqrt(normalized.size)))
+        height = int(math.ceil(normalized.size / width))
+        grid = np.zeros((height * width,), dtype=np.float32)
+        grid[: normalized.size] = normalized
+        grid = grid.reshape(height, width)
+    else:
+        grid = values.astype(np.float32)
+        grid = grid - grid.min()
+        max_val = grid.max()
+        if max_val > 0:
+            grid = grid / max_val
+    grid = (grid * 255.0).clip(0, 255).astype(np.uint8)
+    heatmap = Image.fromarray(grid, mode="L")
+    if output_resolution and (heatmap.size[0] != output_resolution or heatmap.size[1] != output_resolution):
+        heatmap = heatmap.resize((output_resolution, output_resolution), Image.BILINEAR)
+    return heatmap
+
+
+def _tensor_to_image(t: torch.Tensor) -> Image.Image:
+    """Convert [C,H,W] or [H,W] tensor in [0,1] to PIL Image."""
+    if t.dim() == 3:
+        t = t.clamp(0, 1)
+        arr = (t * 255.0).byte().permute(1, 2, 0).cpu().numpy()
+        return Image.fromarray(arr)
+    t = t.clamp(0, 1)
+    arr = (t * 255.0).byte().cpu().numpy()
+    return Image.fromarray(arr)
+
+
+def save_metric_head_records(
+    records,
+    sample_name: str,
+    output_dir: Path,
+    layout: Tuple[int, int, int] | None = None,
+    lq_frame: torch.Tensor | None = None,
+):
+    if not records:
+        logging.warning("No metric head activations captured for %s", sample_name)
+        return
+    sample_dir = Path(output_dir) / Path(sample_name).stem
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {}
+    for layer_idx, tensors in records.items():
+        metadata[str(layer_idx)] = []
+        for call_idx, tensor in enumerate(tensors):
+            tensor = tensor.float()
+            # keep only first batch to avoid large dumps during tiled processing
+            if tensor.dim() == 3:
+                tensor = tensor[0]  # [tokens, 1] or [tokens]
+            values = tensor.reshape(-1).cpu().numpy()
+            base_name = sample_dir / f"layer{layer_idx:02d}_call{call_idx:02d}"
+            np.save(f"{base_name}.npy", values)
+            entry = {
+                "call_index": call_idx,
+                "num_tokens": int(values.size),
+                "min": float(values.min()) if values.size else 0.0,
+                "max": float(values.max()) if values.size else 0.0,
+                "file_prefix": base_name.name,
+            }
+            if layout and values.size == layout[0] * layout[1] * layout[2]:
+                frames, height, width = layout
+                volume = values.reshape(frames, height, width)
+                entry["layout"] = {"frames": frames, "height": height, "width": width}
+                for frame_idx in range(frames):
+                    frame_vals = volume[frame_idx]
+                    heatmap = _render_metric_heatmap(frame_vals)
+                    if lq_frame is not None:
+                        # assume lq_frame shape [C,H,W] or [F,C,H,W]; pick matching frame if available
+                        if lq_frame.dim() == 4 and frame_idx < lq_frame.shape[0]:
+                            lq_img = _tensor_to_image(lq_frame[frame_idx])
+                        elif lq_frame.dim() == 3:
+                            lq_img = _tensor_to_image(lq_frame)
+                        else:
+                            lq_img = None
+                        if lq_img is not None:
+                            # resize lq to heatmap size, then concat horizontally
+                            lq_img = lq_img.resize(heatmap.size, Image.BILINEAR)
+                            combined = Image.new("RGB", (heatmap.width * 2, heatmap.height))
+                            combined.paste(lq_img.convert("RGB"), (0, 0))
+                            combined.paste(heatmap.convert("RGB"), (heatmap.width, 0))
+                            combined.save(f"{base_name}_frame{frame_idx:02d}_heatmap.png")
+                        else:
+                            heatmap.save(f"{base_name}_frame{frame_idx:02d}_heatmap.png")
+                    else:
+                        heatmap.save(f"{base_name}_frame{frame_idx:02d}_heatmap.png")
+            else:
+                heatmap = _render_metric_heatmap(values)
+                heatmap.save(f"{base_name}_heatmap.png")
+            metadata[str(layer_idx)].append(entry)
+    meta_path = sample_dir / "metadata.json"
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
 
 def save_video_with_imageio_lossless(video, output_path, fps=8):
@@ -577,6 +707,13 @@ if __name__ == "__main__":
     parser.add_argument("--token_merge_restore_adapter_expansion", type=int, default=2)
     parser.add_argument("--token_merge_window_size", type=int, default=0)
     parser.add_argument("--token_merge_window_stride", type=int, default=1)
+    parser.add_argument("--token_merge_ratio_start", type=float, default=None)
+    parser.add_argument("--token_merge_ratio_warmup_steps", type=int, default=0)
+    parser.add_argument("--token_merge_ratio_schedule", type=str, default="linear")
+    parser.add_argument("--visualize_metric_heads", action="store_true", help="Save importance maps from token-merge metric heads.")
+    parser.add_argument("--metric_head_layers", type=str, default=None, help="Comma-separated list of transformer layer indices to visualize.")
+    parser.add_argument("--metric_head_output_dir", type=str, default=None, help="Directory to store metric-head visualizations (defaults to output_path/metric_heads).")
+    parser.add_argument("--metric_head_layout", type=str, default=None, help="Optional frames,height,width layout to reshape metric vectors (e.g., '2,80,120').")
 
     parser.add_argument("--profile_transformer", action="store_true",
                     help="Record latency (and FLOPs for the first call if torch.profiler is available) of transformer forward pass")
@@ -737,6 +874,9 @@ if __name__ == "__main__":
                 args.token_merge_restore_adapter_expansion = cfg_data.get("token_merge_restore_adapter_expansion", args.token_merge_restore_adapter_expansion)
                 args.token_merge_window_size = cfg_data.get("token_merge_window_size", args.token_merge_window_size)
                 args.token_merge_window_stride = cfg_data.get("token_merge_window_stride", args.token_merge_window_stride)
+                args.token_merge_ratio_start = cfg_data.get("token_merge_ratio_start", args.token_merge_ratio_start)
+                args.token_merge_ratio_warmup_steps = cfg_data.get("token_merge_ratio_warmup_steps", args.token_merge_ratio_warmup_steps)
+                args.token_merge_ratio_schedule = cfg_data.get("token_merge_ratio_schedule", args.token_merge_ratio_schedule)
             except Exception as err:
                 logging.warning("Failed to parse token_merge_config.json: %s", err)
 
@@ -748,6 +888,9 @@ if __name__ == "__main__":
         restore_adapter_expansion=args.token_merge_restore_adapter_expansion,
         window_size=args.token_merge_window_size,
         window_stride=args.token_merge_window_stride,
+        ratio_start=args.token_merge_ratio_start,
+        ratio_warmup_steps=args.token_merge_ratio_warmup_steps,
+        ratio_schedule=args.token_merge_ratio_schedule,
     )
     load_info = transformer.load_state_dict(state_dict, strict=False)
     if load_info.missing_keys:
@@ -782,6 +925,40 @@ if __name__ == "__main__":
         pipe.register_to_config(**config)
     except Exception:
         pass
+
+    metric_viz = None
+    if args.visualize_metric_heads and getattr(transformer, "metric_heads", None) is not None:
+        metric_layers = _parse_metric_layer_indices(args.metric_head_layers)
+        metric_output_dir = Path(
+            args.metric_head_output_dir or (Path(args.output_path) / "metric_heads")
+        )
+        metric_output_dir.mkdir(parents=True, exist_ok=True)
+        metric_layout = _parse_metric_layout(args.metric_head_layout)
+        metric_viz = {
+            "layers": metric_layers,
+            "output_dir": metric_output_dir,
+            "buffer": {},
+            "enabled": False,
+            "hooks": [],
+            "layout": metric_layout,
+            "current_lq": None,
+        }
+
+        def make_metric_hook(layer_idx):
+            def _hook(module, inputs, output):
+                if not metric_viz["enabled"]:
+                    return
+                if metric_viz["layers"] is not None and layer_idx not in metric_viz["layers"]:
+                    return
+                metric_viz["buffer"].setdefault(layer_idx, []).append(output.detach().cpu())
+            return _hook
+
+        for idx, head in enumerate(transformer.metric_heads):
+            if metric_layers is not None and idx not in metric_layers:
+                continue
+            metric_viz["hooks"].append(head.register_forward_hook(make_metric_hook(idx)))
+    elif args.visualize_metric_heads:
+        logging.warning("Metric head visualization enabled, but transformer has no metric heads.")
 
     # If you're using with lora, add this code
     if args.lora_path:
@@ -848,6 +1025,12 @@ if __name__ == "__main__":
             video = video.unsqueeze(0)
             # [B, C, F, H, W]
             video = video.permute(0, 2, 1, 3, 4).contiguous()
+            if metric_viz:
+                # store the LQ chunk in [F, C, H, W] scaled to [0,1] for visualization
+                lq_chunk = video.clone()
+                lq_chunk = lq_chunk[0]  # [F, C, H, W]
+                lq_chunk = (lq_chunk * 0.5 + 0.5).clamp(0, 1)
+                metric_viz["current_lq"] = lq_chunk
 
             _B, _C, _F, _H, _W = video.shape
             time_chunks = make_temporal_chunks(_F, args.chunk_len, overlap_t)
@@ -855,6 +1038,10 @@ if __name__ == "__main__":
 
             output_video = torch.zeros_like(video)
             write_count = torch.zeros_like(video, dtype=torch.int)
+
+            if metric_viz:
+                metric_viz["buffer"] = {}
+                metric_viz["enabled"] = True
 
             print(f"Process video: {video_name} | Prompt: {prompt} | Frame: {_F} (ori: {original_shape[0]}; pad: {pad_f}) | Target Resolution: {_H}, {_W} (ori: {original_shape[1]*args.upscale}, {original_shape[2]*args.upscale}; pad: {pad_h}, {pad_w}) | Chunk Num: {len(time_chunks)*len(spatial_tiles)}")
 
@@ -903,6 +1090,16 @@ if __name__ == "__main__":
             file_name = os.path.basename(video_path)
             output_path = os.path.join(args.output_path, file_name)
 
+            if metric_viz:
+                metric_viz["enabled"] = False
+                save_metric_head_records(
+                    metric_viz["buffer"],
+                    video_name,
+                    metric_viz["output_dir"],
+                    metric_viz["layout"],
+                    lq_frame=metric_viz.get("current_lq", None),
+                )
+
             if metrics_models is not None:
                 #  [1, C, F, H, W] -> [F, C, H, W]
                 pred_frames = video_generate[0]
@@ -922,6 +1119,10 @@ if __name__ == "__main__":
                 save_video_with_imageio(video_generate, output_path, fps=args.fps, format=args.save_format)
         else:
             print(f"Warning: {video_name} not found in {args.input_dir}")
+
+    if metric_viz:
+        for hook in metric_viz["hooks"]:
+            hook.remove()
 
     if args.profile_transformer and profile_state["times_ms"]:
         avg_time = sum(profile_state["times_ms"]) / len(profile_state["times_ms"])

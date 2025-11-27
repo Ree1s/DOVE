@@ -118,6 +118,9 @@ class Args(BaseModel):
     token_merge_window_size: int = 0
     token_merge_window_stride: int = 1
     token_merge_freeze_routes_only: bool = False
+    token_merge_ratio_start: float | None = None
+    token_merge_ratio_warmup_steps: int = 0
+    token_merge_ratio_schedule: Literal["linear", "cosine"] = "linear"
 
     ########## GAN ##########
     diffusion_gan_max_timestep: int = 1000
@@ -231,6 +234,26 @@ class Args(BaseModel):
         if window_size > 0 and v <= 0:
             raise ValueError("token_merge_window_stride must be > 0 when windowing is enabled")
         return v
+
+    @field_validator("token_merge_ratio_start")
+    def validate_token_merge_ratio_start(cls, v: float | None) -> float | None:
+        if v is not None and not (0.0 <= v <= 1.0):
+            raise ValueError("token_merge_ratio_start must be within [0, 1]")
+        return v
+
+    @field_validator("token_merge_ratio_warmup_steps")
+    def validate_token_merge_ratio_warmup_steps(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("token_merge_ratio_warmup_steps must be non-negative")
+        return v
+
+    @field_validator("token_merge_ratio_schedule")
+    def validate_token_merge_ratio_schedule(cls, v: str) -> str:
+        allowed = {"linear", "cosine"}
+        v_lower = v.lower()
+        if v_lower not in allowed:
+            raise ValueError(f"token_merge_ratio_schedule must be one of {sorted(allowed)}")
+        return v_lower
 
     @field_validator("teacher_model_path")
     def validate_teacher_model(cls, v: Path | None, info: ValidationInfo) -> Path | None:
@@ -423,6 +446,24 @@ class Args(BaseModel):
             type=lambda x: x.lower() == 'true',
             default=False,
             help="Freeze all transformer parameters outside configured token merge routes",
+        )
+        parser.add_argument(
+            "--token_merge_ratio_start",
+            type=float,
+            default=None,
+            help="Optional starting ratio used for curriculum. Defaults to each route's ratio if unset.",
+        )
+        parser.add_argument(
+            "--token_merge_ratio_warmup_steps",
+            type=int,
+            default=0,
+            help="Number of optimizer steps to warm up token merge ratio from start to target.",
+        )
+        parser.add_argument(
+            "--token_merge_ratio_schedule",
+            type=str,
+            default="linear",
+            help="Schedule to interpolate between ratio start and end. Choices: linear, cosine.",
         )
 
         # GAN parameters

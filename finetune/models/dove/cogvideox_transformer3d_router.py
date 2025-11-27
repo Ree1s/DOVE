@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -272,6 +273,9 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         restore_adapter_expansion: int = 2,
         token_merge_window_size: int = 0,
         token_merge_window_stride: int = 1,
+        token_merge_ratio_start: Optional[float] = None,
+        token_merge_ratio_warmup_steps: int = 0,
+        token_merge_ratio_schedule: str = "linear",
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -370,6 +374,9 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             restore_adapter_expansion=restore_adapter_expansion,
             window_size=token_merge_window_size,
             window_stride=token_merge_window_stride,
+            ratio_start=token_merge_ratio_start,
+            ratio_warmup_steps=token_merge_ratio_warmup_steps,
+            ratio_schedule=token_merge_ratio_schedule,
         )
 
     @property
@@ -498,6 +505,9 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         restore_adapter_expansion: int,
         window_size: int,
         window_stride: int,
+        ratio_start: Optional[float],
+        ratio_warmup_steps: int,
+        ratio_schedule: str,
     ) -> None:
         self.config.enable_token_merge = bool(enable_token_merge)
         self.config.token_merge_routes = routes_spec
@@ -506,6 +516,9 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         self.config.restore_adapter_expansion = int(restore_adapter_expansion)
         self.config.token_merge_window_size = int(window_size)
         self.config.token_merge_window_stride = int(window_stride)
+        self.config.token_merge_ratio_start = None if ratio_start is None else float(ratio_start)
+        self.config.token_merge_ratio_warmup_steps = int(max(0, ratio_warmup_steps))
+        self.config.token_merge_ratio_schedule = ratio_schedule.lower()
 
         routes: List[Dict[str, Any]] = []
         num_layers = len(self.transformer_blocks)
@@ -518,6 +531,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                         "start_layer": 0,
                         "end_layer": num_layers - 1,
                         "selection_ratio": float(default_ratio),
+                        "ratio_end": float(default_ratio),
                     }
                 ]
 
@@ -527,19 +541,34 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                 ratio = float(spec["selection_ratio"])
                 if ratio <= 0.0:
                     continue
-                routes.append(
-                    {
-                        "start_layer": start_layer,
-                        "end_layer": end_layer,
-                        "selection_ratio": ratio,
-                    }
-                )
+                route_entry = {
+                    "start_layer": start_layer,
+                    "end_layer": end_layer,
+                    "selection_ratio": ratio,
+                }
+                if "ratio_start" in spec:
+                    route_entry["ratio_start"] = float(spec["ratio_start"])
+                if "ratio_end" in spec:
+                    route_entry["ratio_end"] = float(spec["ratio_end"])
+                routes.append(route_entry)
+
+        global_ratio_start = self.config.token_merge_ratio_start
+        for route in routes:
+            ratio_end = float(route.get("ratio_end", route["selection_ratio"]))
+            ratio_start_value = route.get("ratio_start", None)
+            if ratio_start_value is None:
+                ratio_start_value = global_ratio_start if global_ratio_start is not None else ratio_end
+            route["ratio_start"] = float(ratio_start_value)
+            route["ratio_end"] = float(ratio_end)
+            route["selection_ratio"] = float(ratio_end)
 
         self._routes = routes
         should_enable = enable_token_merge and len(routes) > 0
         self.enable_token_merge = should_enable
         self._token_merge_seed = seed
         self._warned_rotary_batch_mismatch = False
+        self._token_merge_curriculum_progress = 1.0
+        self._token_merge_curriculum_active = False
 
         if should_enable:
             self.router = Router(seed=seed, window_size=window_size, window_stride=window_stride)
@@ -550,6 +579,14 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         for head in self.metric_heads:
             head.requires_grad_(should_enable)
 
+        if should_enable:
+            needs_curriculum = any(
+                abs(route["ratio_end"] - route["ratio_start"]) > 1e-6 for route in routes
+            ) and self.config.token_merge_ratio_warmup_steps > 0
+            self._token_merge_curriculum_active = needs_curriculum
+            if self._token_merge_curriculum_active:
+                self._apply_token_merge_curriculum_progress(0.0)
+
     def configure_token_merge(
         self,
         enable_token_merge: bool,
@@ -559,6 +596,9 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         restore_adapter_expansion: int,
         window_size: int = 0,
         window_stride: int = 1,
+        ratio_start: Optional[float] = None,
+        ratio_warmup_steps: int = 0,
+        ratio_schedule: str = "linear",
     ) -> None:
         self._configure_token_merge(
             enable_token_merge,
@@ -568,6 +608,9 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             restore_adapter_expansion,
             window_size,
             window_stride,
+            ratio_start,
+            ratio_warmup_steps,
+            ratio_schedule,
         )
 
     def freeze_parameters_to_routes(self) -> None:
@@ -603,6 +646,35 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                 param.requires_grad_(True)
 
         logger.info("Token merge route training unfroze transformer layers %s", valid_layers)
+
+    def _curriculum_interpolate(self, start: float, end: float, progress: float) -> float:
+        schedule = getattr(self.config, "token_merge_ratio_schedule", "linear")
+        progress = max(0.0, min(1.0, progress))
+        if schedule == "cosine":
+            weight = 0.5 - 0.5 * math.cos(math.pi * progress)
+        else:
+            weight = progress
+        return start + (end - start) * weight
+
+    def _apply_token_merge_curriculum_progress(self, progress: float) -> None:
+        if not self.enable_token_merge or not self._routes:
+            return
+        for route in self._routes:
+            start = float(route.get("ratio_start", route["selection_ratio"]))
+            end = float(route.get("ratio_end", route["selection_ratio"]))
+            route["selection_ratio"] = float(self._curriculum_interpolate(start, end, progress))
+        self._token_merge_curriculum_progress = max(0.0, min(1.0, progress))
+
+    def update_token_merge_progress(self, global_step: int) -> None:
+        if not self._token_merge_curriculum_active or not self.enable_token_merge:
+            return
+        total_steps = max(1, int(self.config.token_merge_ratio_warmup_steps))
+        progress = float(global_step) / float(total_steps)
+        prev_progress = getattr(self, "_token_merge_curriculum_progress", 0.0)
+        progress = max(prev_progress, min(progress, 1.0))
+        if abs(progress - prev_progress) < 1e-6 and progress >= 1.0:
+            return
+        self._apply_token_merge_curriculum_progress(progress)
 
     def _reduce_image_rotary_emb(
         self,
@@ -738,12 +810,12 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                     num_frames=frame_groups,
                     importance_map=importance_map,
                 )
-                # logger.info(
-                #     "TokenMerge start layer %s: combined_tokens %s -> reduced_tokens %s",
-                #     i,
-                #     list(combined_tokens.shape),
-                #     list(reduced_tokens.shape),
-                # )
+                logger.info(
+                    "TokenMerge start layer %s: combined_tokens %s -> reduced_tokens %s",
+                    i,
+                    list(combined_tokens.shape),
+                    list(reduced_tokens.shape),
+                )
                 encoder_hidden_states = reduced_tokens[:, :text_seq_length]
                 hidden_states = reduced_tokens[:, text_seq_length:]
                 rotary_emb_current = self._reduce_image_rotary_emb(base_image_rotary_emb, active_route_info)
@@ -807,12 +879,12 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                             active_route_info, text_seq_length, restored_tokens.device
                         )
                         restored_tokens = adapter(restored_tokens, restore_mask)
-                # logger.info(
-                #     "TokenMerge end layer %s: combined_tokens %s -> restored_tokens %s",
-                #     i,
-                #     list(combined_tokens.shape),
-                #     list(restored_tokens.shape),
-                # )
+                logger.info(
+                    "TokenMerge end layer %s: combined_tokens %s -> restored_tokens %s",
+                    i,
+                    list(combined_tokens.shape),
+                    list(restored_tokens.shape),
+                )
 
                 encoder_hidden_states = restored_tokens[:, :text_seq_length]
                 hidden_states = restored_tokens[:, text_seq_length:]

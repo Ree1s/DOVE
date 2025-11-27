@@ -86,6 +86,9 @@ class DOVES2Trainer(Trainer):
                 restore_adapter_expansion=int(self.args.token_merge_restore_adapter_expansion),
                 window_size=int(self.args.token_merge_window_size),
                 window_stride=int(self.args.token_merge_window_stride),
+                ratio_start=self.args.token_merge_ratio_start,
+                ratio_warmup_steps=int(self.args.token_merge_ratio_warmup_steps),
+                ratio_schedule=self.args.token_merge_ratio_schedule,
             )
 
             if self.args.token_merge_freeze_routes_only:

@@ -14,7 +14,7 @@ from diffusers import (
 )
 
 from transformers import set_seed
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
 from safetensors.torch import load_file
 
@@ -80,14 +80,79 @@ def load_sequence(path):
     # return a tensor of shape [F, C, H, W] // 0, 1
     if os.path.isdir(path):
         return read_image_folder(path)
-    elif os.path.isfile(path):
+    if os.path.isfile(path):
         if is_video_file(path):
             return read_video_frames(path)
-        elif path.lower().endswith(('.png', '.jpg', '.jpeg')):
+        if path.lower().endswith(('.png', '.jpg', '.jpeg')):
             # Treat image as a single-frame video
             img = to_tensor(Image.open(path).convert("RGB"))
             return img.unsqueeze(0)  # [1, C, H, W]
-    raise ValueError(f"Unsupported input: {path}")
+
+    # Fallback: if a video filename does not exist, try a folder with the same stem.
+    path_obj = Path(path)
+    if path_obj.suffix and not path_obj.exists():
+        stem_dir = path_obj.with_suffix("")
+        if stem_dir.is_dir():
+            return read_image_folder(str(stem_dir))
+
+    raise ValueError(f"Unsupported input or missing file: {path}")
+
+
+def parse_layer_list(spec: str, max_layers: int) -> List[int]:
+    """Parse comma/range syntax like '0,3,5-7' into a sorted unique list."""
+    if not spec:
+        return []
+    layers: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                start, end = end, start
+            for idx in range(start, end + 1):
+                layers.add(idx)
+        else:
+            layers.add(int(part))
+
+    invalid = [idx for idx in layers if idx < 0 or idx >= max_layers]
+    if invalid:
+        raise ValueError(f"skip_layers indices out of range [0, {max_layers-1}]: {sorted(invalid)}")
+    return sorted(layers)
+
+
+class SkipBlock(torch.nn.Module):
+    """Identity transformer block used to ablate specific layers."""
+
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        temb,
+        image_rotary_emb=None,
+        attention_kwargs=None,
+    ):
+        return hidden_states, encoder_hidden_states
+
+
+def apply_layer_skips(transformer, skip_layers: List[int]):
+    """Replace selected transformer blocks with identity wrappers and return a restore function."""
+    originals = {}
+    if not skip_layers:
+        return lambda: None
+    for idx in skip_layers:
+        originals[idx] = transformer.transformer_blocks[idx]
+        transformer.transformer_blocks[idx] = SkipBlock()
+
+    def restore():
+        for idx, module in originals.items():
+            transformer.transformer_blocks[idx] = module
+
+    return restore
+
 
 @no_grad
 def compute_metrics(pred_frames, gt_frames, metrics_model, metric_accumulator, file_name):
@@ -538,6 +603,9 @@ if __name__ == "__main__":
     parser.add_argument("--profile_transformer", action="store_true",
                     help="Record latency (and FLOPs for the first call if torch.profiler is available) of transformer forward pass")
 
+    parser.add_argument("--skip_layers", type=str, default="",
+                        help="Comma-separated or range syntax (e.g., '0,5,10-12') of transformer blocks to skip for ablation")
+
     parser.add_argument("--is_cpu_offload", action="store_true", help="Enable CPU offload for the model")
 
     parser.add_argument("--is_vae_st", action="store_true", help="Enable VAE slicing and tiling")
@@ -705,6 +773,13 @@ if __name__ == "__main__":
         pipe.enable_sequential_cpu_offload()
     else:
         pipe.to("cuda")
+
+    restore_skips = None
+    max_layers = len(pipe.transformer.transformer_blocks)
+    skip_layers = parse_layer_list(args.skip_layers, max_layers)
+    if skip_layers:
+        print(f"Skipping transformer layers (0-indexed): {skip_layers} / total {max_layers}")
+        restore_skips = apply_layer_skips(pipe.transformer, skip_layers)
     
     if args.is_vae_st:
         pipe.vae.enable_slicing()
@@ -852,5 +927,8 @@ if __name__ == "__main__":
         }
         with open(out_path, 'w') as f:
             json.dump(output, f, indent=2)
+
+    if restore_skips is not None:
+        restore_skips()
 
     print("All videos processed.")
