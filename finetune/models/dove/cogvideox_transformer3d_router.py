@@ -276,6 +276,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         token_merge_ratio_start: Optional[float] = None,
         token_merge_ratio_warmup_steps: int = 0,
         token_merge_ratio_schedule: str = "linear",
+        token_merge_use_psg_importance: bool = False,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -377,6 +378,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             ratio_start=token_merge_ratio_start,
             ratio_warmup_steps=token_merge_ratio_warmup_steps,
             ratio_schedule=token_merge_ratio_schedule,
+            use_psg_importance=token_merge_use_psg_importance,
         )
 
     @property
@@ -508,6 +510,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         ratio_start: Optional[float],
         ratio_warmup_steps: int,
         ratio_schedule: str,
+        use_psg_importance: bool,
     ) -> None:
         self.config.enable_token_merge = bool(enable_token_merge)
         self.config.token_merge_routes = routes_spec
@@ -519,6 +522,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         self.config.token_merge_ratio_start = None if ratio_start is None else float(ratio_start)
         self.config.token_merge_ratio_warmup_steps = int(max(0, ratio_warmup_steps))
         self.config.token_merge_ratio_schedule = ratio_schedule.lower()
+        self.config.token_merge_use_psg_importance = bool(use_psg_importance)
 
         routes: List[Dict[str, Any]] = []
         num_layers = len(self.transformer_blocks)
@@ -599,6 +603,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         ratio_start: Optional[float] = None,
         ratio_warmup_steps: int = 0,
         ratio_schedule: str = "linear",
+        use_psg_importance: bool = False,
     ) -> None:
         self._configure_token_merge(
             enable_token_merge,
@@ -611,6 +616,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             ratio_start,
             ratio_warmup_steps,
             ratio_schedule,
+            use_psg_importance,
         )
 
     def freeze_parameters_to_routes(self) -> None:
@@ -783,6 +789,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         active_route_info = None
         base_image_rotary_emb = image_rotary_emb
         rotary_emb_current = image_rotary_emb
+        use_psg_importance = getattr(self.config, "token_merge_use_psg_importance", False)
 
         total_relational_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         distillation_loss_applied = False
@@ -809,6 +816,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                     text_length=text_seq_length,
                     num_frames=frame_groups,
                     importance_map=importance_map,
+                    use_psg_importance=use_psg_importance,
                 )
                 logger.info(
                     "TokenMerge start layer %s: combined_tokens %s -> reduced_tokens %s",
