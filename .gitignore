@@ -12,3 +12,6 @@ finetune/wandb/
 *.log
 *.out
 VideoScore2
+*.log
+*.pdf
+*.mp4

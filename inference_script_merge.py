@@ -710,6 +710,11 @@ if __name__ == "__main__":
     parser.add_argument("--token_merge_ratio_start", type=float, default=None)
     parser.add_argument("--token_merge_ratio_warmup_steps", type=int, default=0)
     parser.add_argument("--token_merge_ratio_schedule", type=str, default="linear")
+    parser.add_argument("--token_merge_use_psg_importance", action="store_true")
+    parser.add_argument("--token_merge_layer_gate_group_size", type=int, default=0)
+    parser.add_argument("--token_merge_layer_gate_keep_per_group", type=int, default=0)
+    parser.add_argument("--token_merge_layer_gate_tau", type=float, default=1.0)
+    parser.add_argument("--token_merge_layer_gate_logit_scale", type=float, default=1.0)
     parser.add_argument("--visualize_metric_heads", action="store_true", help="Save importance maps from token-merge metric heads.")
     parser.add_argument("--metric_head_layers", type=str, default=None, help="Comma-separated list of transformer layer indices to visualize.")
     parser.add_argument("--metric_head_output_dir", type=str, default=None, help="Directory to store metric-head visualizations (defaults to output_path/metric_heads).")
@@ -877,6 +882,19 @@ if __name__ == "__main__":
                 args.token_merge_ratio_start = cfg_data.get("token_merge_ratio_start", args.token_merge_ratio_start)
                 args.token_merge_ratio_warmup_steps = cfg_data.get("token_merge_ratio_warmup_steps", args.token_merge_ratio_warmup_steps)
                 args.token_merge_ratio_schedule = cfg_data.get("token_merge_ratio_schedule", args.token_merge_ratio_schedule)
+                args.token_merge_use_psg_importance = cfg_data.get("token_merge_use_psg_importance", args.token_merge_use_psg_importance)
+                args.token_merge_layer_gate_group_size = cfg_data.get(
+                    "token_merge_layer_gate_group_size", args.token_merge_layer_gate_group_size
+                )
+                args.token_merge_layer_gate_keep_per_group = cfg_data.get(
+                    "token_merge_layer_gate_keep_per_group", args.token_merge_layer_gate_keep_per_group
+                )
+                args.token_merge_layer_gate_tau = cfg_data.get(
+                    "token_merge_layer_gate_tau", args.token_merge_layer_gate_tau
+                )
+                args.token_merge_layer_gate_logit_scale = cfg_data.get(
+                    "token_merge_layer_gate_logit_scale", args.token_merge_layer_gate_logit_scale
+                )
             except Exception as err:
                 logging.warning("Failed to parse token_merge_config.json: %s", err)
 
@@ -891,6 +909,11 @@ if __name__ == "__main__":
         ratio_start=args.token_merge_ratio_start,
         ratio_warmup_steps=args.token_merge_ratio_warmup_steps,
         ratio_schedule=args.token_merge_ratio_schedule,
+        use_psg_importance=args.token_merge_use_psg_importance,
+        layer_gate_group_size=args.token_merge_layer_gate_group_size if hasattr(args, "token_merge_layer_gate_group_size") else 0,
+        layer_gate_keep_per_group=args.token_merge_layer_gate_keep_per_group if hasattr(args, "token_merge_layer_gate_keep_per_group") else 0,
+        layer_gate_tau=args.token_merge_layer_gate_tau if hasattr(args, "token_merge_layer_gate_tau") else 1.0,
+        layer_gate_logit_scale=args.token_merge_layer_gate_logit_scale if hasattr(args, "token_merge_layer_gate_logit_scale") else 1.0,
     )
     load_info = transformer.load_state_dict(state_dict, strict=False)
     if load_info.missing_keys:

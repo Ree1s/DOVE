@@ -121,6 +121,11 @@ class Args(BaseModel):
     token_merge_ratio_start: float | None = None
     token_merge_ratio_warmup_steps: int = 0
     token_merge_ratio_schedule: Literal["linear", "cosine"] = "linear"
+    token_merge_use_psg_importance: bool = False
+    token_merge_layer_gate_group_size: int = 0
+    token_merge_layer_gate_keep_per_group: int = 0
+    token_merge_layer_gate_tau: float = 1.0
+    token_merge_layer_gate_logit_scale: float = 1.0
 
     ########## GAN ##########
     diffusion_gan_max_timestep: int = 1000
@@ -245,6 +250,12 @@ class Args(BaseModel):
     def validate_token_merge_ratio_warmup_steps(cls, v: int) -> int:
         if v < 0:
             raise ValueError("token_merge_ratio_warmup_steps must be non-negative")
+        return v
+
+    @field_validator("token_merge_layer_gate_group_size", "token_merge_layer_gate_keep_per_group")
+    def validate_layer_gate_ints(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("layer gate parameters must be non-negative")
         return v
 
     @field_validator("token_merge_ratio_schedule")
@@ -464,6 +475,36 @@ class Args(BaseModel):
             type=str,
             default="linear",
             help="Schedule to interpolate between ratio start and end. Choices: linear, cosine.",
+        )
+        parser.add_argument(
+            "--token_merge_use_psg_importance",
+            type=lambda x: x.lower() == 'true',
+            default=False,
+            help="Use PSG-style temporal curvature to build importance maps for token merge.",
+        )
+        parser.add_argument(
+            "--token_merge_layer_gate_group_size",
+            type=int,
+            default=0,
+            help="Group size for learnable layer-level merge gating (0 disables gating).",
+        )
+        parser.add_argument(
+            "--token_merge_layer_gate_keep_per_group",
+            type=int,
+            default=0,
+            help="Number of layers to keep merge-enabled per group (0 disables gating).",
+        )
+        parser.add_argument(
+            "--token_merge_layer_gate_tau",
+            type=float,
+            default=1.0,
+            help="Gumbel-Softmax temperature for layer merge gating.",
+        )
+        parser.add_argument(
+            "--token_merge_layer_gate_logit_scale",
+            type=float,
+            default=1.0,
+            help="Logit scaling factor for layer merge gating.",
         )
 
         # GAN parameters

@@ -101,6 +101,11 @@ def load_token_merge(base_transformer, args):
         ratio_start=args.token_merge_ratio_start,
         ratio_warmup_steps=args.token_merge_ratio_warmup_steps,
         ratio_schedule=args.token_merge_ratio_schedule,
+        use_psg_importance=args.token_merge_use_psg_importance,
+        layer_gate_group_size=args.token_merge_layer_gate_group_size,
+        layer_gate_keep_per_group=args.token_merge_layer_gate_keep_per_group,
+        layer_gate_tau=args.token_merge_layer_gate_tau,
+        layer_gate_logit_scale=args.token_merge_layer_gate_logit_scale,
     )
     if args.token_merge_freeze_routes_only:
         tm_transformer.freeze_parameters_to_routes()
@@ -127,6 +132,11 @@ def parse_args():
     parser.add_argument("--token_merge_ratio_warmup_steps", type=int, default=0)
     parser.add_argument("--token_merge_ratio_schedule", type=str, default="linear", choices=["linear", "cosine"])
     parser.add_argument("--token_merge_freeze_routes_only", action="store_true")
+    parser.add_argument("--token_merge_use_psg_importance", action="store_true")
+    parser.add_argument("--token_merge_layer_gate_group_size", type=int, default=0)
+    parser.add_argument("--token_merge_layer_gate_keep_per_group", type=int, default=0)
+    parser.add_argument("--token_merge_layer_gate_tau", type=float, default=1.0)
+    parser.add_argument("--token_merge_layer_gate_logit_scale", type=float, default=1.0)
 
     return parser.parse_args()
 

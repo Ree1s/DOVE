@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import itertools
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -277,6 +278,10 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         token_merge_ratio_warmup_steps: int = 0,
         token_merge_ratio_schedule: str = "linear",
         token_merge_use_psg_importance: bool = False,
+        token_merge_layer_gate_group_size: int = 0,
+        token_merge_layer_gate_keep_per_group: int = 0,
+        token_merge_layer_gate_tau: float = 1.0,
+        token_merge_layer_gate_logit_scale: float = 1.0,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -379,6 +384,10 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             ratio_warmup_steps=token_merge_ratio_warmup_steps,
             ratio_schedule=token_merge_ratio_schedule,
             use_psg_importance=token_merge_use_psg_importance,
+            layer_gate_group_size=token_merge_layer_gate_group_size,
+            layer_gate_keep_per_group=token_merge_layer_gate_keep_per_group,
+            layer_gate_tau=token_merge_layer_gate_tau,
+            layer_gate_logit_scale=token_merge_layer_gate_logit_scale,
         )
 
     @property
@@ -511,6 +520,10 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         ratio_warmup_steps: int,
         ratio_schedule: str,
         use_psg_importance: bool,
+        layer_gate_group_size: int,
+        layer_gate_keep_per_group: int,
+        layer_gate_tau: float,
+        layer_gate_logit_scale: float,
     ) -> None:
         self.config.enable_token_merge = bool(enable_token_merge)
         self.config.token_merge_routes = routes_spec
@@ -523,6 +536,10 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         self.config.token_merge_ratio_warmup_steps = int(max(0, ratio_warmup_steps))
         self.config.token_merge_ratio_schedule = ratio_schedule.lower()
         self.config.token_merge_use_psg_importance = bool(use_psg_importance)
+        self.config.layer_gate_group_size = int(layer_gate_group_size)
+        self.config.layer_gate_keep_per_group = int(layer_gate_keep_per_group)
+        self.config.layer_gate_tau = float(layer_gate_tau)
+        self.config.layer_gate_logit_scale = float(layer_gate_logit_scale)
 
         routes: List[Dict[str, Any]] = []
         num_layers = len(self.transformer_blocks)
@@ -591,6 +608,16 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             if self._token_merge_curriculum_active:
                 self._apply_token_merge_curriculum_progress(0.0)
 
+        self._layer_gate_enabled = False
+        self._layer_gate_group_size = max(0, int(layer_gate_group_size))
+        self._layer_gate_keep_per_group = max(0, int(layer_gate_keep_per_group))
+        self._layer_gate_tau = float(layer_gate_tau)
+        self._layer_gate_logit_scale = float(layer_gate_logit_scale)
+        self._layer_gate_options: List[torch.Tensor] = []
+        self._layer_gate_logits = nn.ParameterList()
+        if self._layer_gate_group_size > 0 and self._layer_gate_keep_per_group > 0:
+            self._setup_layer_gates()
+
     def configure_token_merge(
         self,
         enable_token_merge: bool,
@@ -604,6 +631,10 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         ratio_warmup_steps: int = 0,
         ratio_schedule: str = "linear",
         use_psg_importance: bool = False,
+        layer_gate_group_size: int = 0,
+        layer_gate_keep_per_group: int = 0,
+        layer_gate_tau: float = 1.0,
+        layer_gate_logit_scale: float = 1.0,
     ) -> None:
         self._configure_token_merge(
             enable_token_merge,
@@ -617,7 +648,50 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
             ratio_warmup_steps,
             ratio_schedule,
             use_psg_importance,
+            layer_gate_group_size,
+            layer_gate_keep_per_group,
+            layer_gate_tau,
+            layer_gate_logit_scale,
         )
+
+    def _setup_layer_gates(self) -> None:
+        self._layer_gate_options = []
+        self._layer_gate_logits = nn.ParameterList()
+        num_layers = len(self.transformer_blocks)
+        group = max(1, self._layer_gate_group_size)
+        keep = max(0, self._layer_gate_keep_per_group)
+        for start in range(0, num_layers, group):
+            group_len = min(group, num_layers - start)
+            keep_curr = min(keep, group_len)
+            if keep_curr <= 0:
+                continue
+            combs = list(itertools.combinations(range(group_len), keep_curr))
+            if not combs:
+                continue
+            opts = torch.zeros((len(combs), group_len), dtype=torch.float32)
+            for idx, comb in enumerate(combs):
+                opts[idx, list(comb)] = 1.0
+            self._layer_gate_options.append(opts)
+            self._layer_gate_logits.append(nn.Parameter(torch.zeros(1, len(combs))))
+        self._layer_gate_enabled = len(self._layer_gate_options) > 0
+
+    def _sample_layer_gate_mask(self, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if not getattr(self, "_layer_gate_enabled", False) or not self._layer_gate_options:
+            return None
+        masks: List[torch.Tensor] = []
+        for opts, logits in zip(self._layer_gate_options, self._layer_gate_logits):
+            scaled = logits * self._layer_gate_logit_scale
+            if self.training:
+                weights = F.gumbel_softmax(scaled, tau=self._layer_gate_tau, hard=True)
+            else:
+                idx = int(torch.argmax(scaled, dim=1).item()) if scaled.numel() > 0 else 0
+                weights = torch.zeros_like(scaled)
+                weights[0, idx] = 1.0
+            mask = weights @ opts.to(device=device, dtype=dtype)
+            masks.append(mask.squeeze(0))
+        if not masks:
+            return None
+        return torch.cat(masks, dim=0)
 
     def freeze_parameters_to_routes(self) -> None:
         """Freeze all parameters except those belonging to routed transformer layers."""
@@ -790,18 +864,40 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
         base_image_rotary_emb = image_rotary_emb
         rotary_emb_current = image_rotary_emb
         use_psg_importance = getattr(self.config, "token_merge_use_psg_importance", False)
+        layer_gate_mask = self._sample_layer_gate_mask(hidden_states.device, hidden_states.dtype)
+        if layer_gate_mask is not None:
+            try:
+                logger.info("Layer gate mask (len %s): %s", layer_gate_mask.numel(), layer_gate_mask.detach().cpu().tolist())
+            except Exception:
+                logger.info("Layer gate mask available but failed to log as list.")
 
         total_relational_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         distillation_loss_applied = False
 
         for i, block in enumerate(self.transformer_blocks):
+            gate_val = layer_gate_mask[i] if layer_gate_mask is not None and i < layer_gate_mask.numel() else 1.0
+            gate_merge = gate_val < 0.5  # gate==0 => start/keep merge, gate==1 => end/avoid
+            try:
+                logger.info(
+                    "Layer %s | gate=%.3f | active_route=%s | hs=%s enc=%s",
+                    i,
+                    float(gate_val),
+                    active_route_info is not None,
+                    list(hidden_states.shape),
+                    list(encoder_hidden_states.shape),
+                )
+            except Exception:
+                logger.info("Layer %s | gate logging failed.", i)
+
+            # Start merge when gate indicates and none active.
             if (
-                self.enable_token_merge
-                and self.router is not None
+                gate_merge
                 and active_route_info is None
-                and route_idx < len(routes)
-                and i == routes[route_idx]["start_layer"]
+                and self.enable_token_merge
+                and self.router is not None
+                and len(routes) > 0
             ):
+                route_cfg = routes[route_idx % len(routes)]
                 combined_tokens = torch.cat([encoder_hidden_states, hidden_states], dim=1)
                 importance_map = None
                 if self.metric_heads is not None:
@@ -812,14 +908,14 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                         importance_map = metric_head(metric_input).squeeze(-1)
                 reduced_tokens, active_route_info = self.router.tome_merge_and_route(
                     combined_tokens,
-                    selection_ratio=routes[route_idx]["selection_ratio"],
+                    selection_ratio=route_cfg["selection_ratio"],
                     text_length=text_seq_length,
                     num_frames=frame_groups,
                     importance_map=importance_map,
                     use_psg_importance=use_psg_importance,
                 )
                 logger.info(
-                    "TokenMerge start layer %s: combined_tokens %s -> reduced_tokens %s",
+                    "TokenMerge start layer %s (gate=0): combined_tokens %s -> reduced_tokens %s",
                     i,
                     list(combined_tokens.shape),
                     list(reduced_tokens.shape),
@@ -827,6 +923,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                 encoder_hidden_states = reduced_tokens[:, :text_seq_length]
                 hidden_states = reduced_tokens[:, text_seq_length:]
                 rotary_emb_current = self._reduce_image_rotary_emb(base_image_rotary_emb, active_route_info)
+                route_idx += 1
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
@@ -869,12 +966,12 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                     total_relational_loss = total_relational_loss + layer_loss.to(total_relational_loss.dtype)
                     distillation_loss_applied = True
 
+            # End merge when gate flips to 1 while active.
             if (
-                self.enable_token_merge
+                active_route_info is not None
+                and (not gate_merge)
+                and self.enable_token_merge
                 and self.router is not None
-                and active_route_info is not None
-                and route_idx < len(routes)
-                and i == routes[route_idx]["end_layer"]
             ):
                 combined_tokens = torch.cat([encoder_hidden_states, hidden_states], dim=1)
                 restored_tokens = self.router.end_route(combined_tokens, active_route_info)
@@ -888,7 +985,7 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                         )
                         restored_tokens = adapter(restored_tokens, restore_mask)
                 logger.info(
-                    "TokenMerge end layer %s: combined_tokens %s -> restored_tokens %s",
+                    "TokenMerge end layer %s (gate=1): combined_tokens %s -> restored_tokens %s",
                     i,
                     list(combined_tokens.shape),
                     list(restored_tokens.shape),
@@ -897,10 +994,29 @@ class TokenMergeCogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapter
                 encoder_hidden_states = restored_tokens[:, :text_seq_length]
                 hidden_states = restored_tokens[:, text_seq_length:]
                 active_route_info = None
-                route_idx += 1
                 rotary_emb_current = base_image_rotary_emb
 
         hidden_states = self.norm_final(hidden_states)
+
+        # Ensure any active route is closed before unpatchify.
+        if active_route_info is not None and self.enable_token_merge and self.router is not None:
+            combined_tokens = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+            restored_tokens = self.router.end_route(combined_tokens, active_route_info)
+            if self.restore_adapter is not None:
+                adapter = self.restore_adapter.to(device=restored_tokens.device, dtype=restored_tokens.dtype)
+                has_restored = any(idx.numel() > 0 for idx in active_route_info.src_idx)
+                if has_restored:
+                    restore_mask = self._build_restore_mask(active_route_info, text_seq_length, restored_tokens.device)
+                    restored_tokens = adapter(restored_tokens, restore_mask)
+            logger.info(
+                "TokenMerge end (finalize): combined_tokens %s -> restored_tokens %s",
+                list(combined_tokens.shape),
+                list(restored_tokens.shape),
+            )
+            encoder_hidden_states = restored_tokens[:, :text_seq_length]
+            hidden_states = restored_tokens[:, text_seq_length:]
+            active_route_info = None
+            rotary_emb_current = base_image_rotary_emb
 
         # 4. Final block
         hidden_states = self.norm_out(hidden_states, temb=emb)

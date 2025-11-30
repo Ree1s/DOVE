@@ -4,7 +4,7 @@
 export TOKENIZERS_PARALLELISM=false
 
 # Default hyperparameters (mirrors HPC launcher so this script is self-contained)
-TOKEN_MERGE_ROUTES="${TOKEN_MERGE_ROUTES:-}"
+TOKEN_MERGE_ROUTES="${TOKEN_MERGE_ROUTES:-10-17@0.36;28-35@0.36}"
 TOKEN_MERGE_DEFAULT_RATIO="${TOKEN_MERGE_DEFAULT_RATIO:-0.0}"
 TOKEN_MERGE_SEED="${TOKEN_MERGE_SEED:-42}"
 TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION="${TOKEN_MERGE_RESTORE_ADAPTER_EXPANSION:-2}"
@@ -17,11 +17,11 @@ TOKEN_MERGE_LAYER_GATE_TAU="${TOKEN_MERGE_LAYER_GATE_TAU:-1.0}"
 TOKEN_MERGE_LAYER_GATE_LOGIT_SCALE="${TOKEN_MERGE_LAYER_GATE_LOGIT_SCALE:-1.0}"
 
 ENABLE_RELATIONAL_KD="${ENABLE_RELATIONAL_KD:-false}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/data/42-julia-hpc-rz-cv/sig95vg/DOVE/pretrained_models/DOVE/}"
 RELATIONAL_KD_WEIGHT="${RELATIONAL_KD_WEIGHT:-0.0}"
 RELATIONAL_KD_LAYERS="${RELATIONAL_KD_LAYERS:-}"
-ENABLE_TEACHER_LPIPS_KD="${ENABLE_TEACHER_LPIPS_KD:-false}"
-TEACHER_LPIPS_WEIGHT="${TEACHER_LPIPS_WEIGHT:-0.0}"
+ENABLE_TEACHER_LPIPS_KD="${ENABLE_TEACHER_LPIPS_KD:-true}"
+TEACHER_LPIPS_WEIGHT="${TEACHER_LPIPS_WEIGHT:-0.2}"
 TOKEN_MERGE_RATIO_START="${TOKEN_MERGE_RATIO_START:-0.1}"
 TOKEN_MERGE_RATIO_WARMUP_STEPS="${TOKEN_MERGE_RATIO_WARMUP_STEPS:-200}"
 TOKEN_MERGE_RATIO_SCHEDULE="${TOKEN_MERGE_RATIO_SCHEDULE:-cosine}"
@@ -41,7 +41,7 @@ MODEL_ARGS=(
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2_token_merge_gate_skip"
+    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s2_token_merge_gate_kd0.2"
     --report_to "wandb"
 )
 
@@ -61,7 +61,7 @@ TRAIN_ARGS=(
     --train_epochs 10 # number of training epochs
     --train_steps 1000
     --seed 42 # random seed
-    --batch_size 2
+    --batch_size 1
     --gradient_accumulation_steps 1
     --mixed_precision "bf16"  # ["no", "fp16"] # Only CogVideoX-2B supports fp16 training
     --learning_rate 5e-6
@@ -162,7 +162,7 @@ TOKEN_MERGE_ARGS+=(--token_merge_layer_gate_logit_scale "${TOKEN_MERGE_LAYER_GAT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Combine all arguments and launch training with token merge
-accelerate launch --config_file "${SCRIPT_DIR}/accelerate_config.yaml" "${SCRIPT_DIR}/train.py" \
+accelerate launch --config_file "${SCRIPT_DIR}/accelerate_config_debug.yaml" "${SCRIPT_DIR}/train.py" \
     "${MODEL_ARGS[@]}" \
     "${LORA_ARGS[@]}" \
     "${OUTPUT_ARGS[@]}" \

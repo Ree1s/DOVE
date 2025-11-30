@@ -69,6 +69,11 @@ class DOVES1Trainer(Trainer):
                 ratio_start=self.args.token_merge_ratio_start,
                 ratio_warmup_steps=int(self.args.token_merge_ratio_warmup_steps),
                 ratio_schedule=self.args.token_merge_ratio_schedule,
+                use_psg_importance=bool(getattr(self.args, "token_merge_use_psg_importance", False)),
+                layer_gate_group_size=int(getattr(self.args, "token_merge_layer_gate_group_size", 0)),
+                layer_gate_keep_per_group=int(getattr(self.args, "token_merge_layer_gate_keep_per_group", 0)),
+                layer_gate_tau=float(getattr(self.args, "token_merge_layer_gate_tau", 1.0)),
+                layer_gate_logit_scale=float(getattr(self.args, "token_merge_layer_gate_logit_scale", 1.0)),
             )
 
             if not transformer.enable_token_merge:
