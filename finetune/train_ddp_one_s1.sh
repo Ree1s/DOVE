@@ -18,21 +18,21 @@ MODEL_ARGS=(
 
 # Output Configuration
 OUTPUT_ARGS=(
-    --output_dir "checkpoint/DOVE-s1"
+    --output_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s1-30steps"
     --report_to "wandb"
 )
 
 # Data Configuration
 DATA_ARGS=(
-    --data_root "../datasets/train"
-    --video_column "../datasets/train/HQ-VSR.txt"
+    --data_root "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/HQ-VSR"
+    --video_column "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/train/HQ-VSR.txt"
     --train_resolution "25x320x640"  # (frames x height x width), frames should be 8N+1
 )
 
 # Training Configuration
 TRAIN_ARGS=(
     --train_epochs 1000 # number of training epochs
-    --train_steps 10000
+    --train_steps 100000
     --seed 42 # random seed
     --batch_size 2
     --gradient_accumulation_steps 1
@@ -45,7 +45,7 @@ TRAIN_ARGS=(
 
 # System Configuration
 SYSTEM_ARGS=(
-    --num_workers 8
+    --num_workers 0
     --pin_memory True
     --nccl_timeout 1800
     --stastic_frequency 500
@@ -55,20 +55,20 @@ SYSTEM_ARGS=(
 CHECKPOINT_ARGS=(
     --checkpointing_steps 1000 # save checkpoint every x steps
     --checkpointing_limit 3 # maximum number of checkpoints to keep, after which the oldest one is deleted
-    # --resume_from_checkpoint "/absolute/path/to/checkpoint_dir"  # if you want to resume from a checkpoint, otherwise, comment this line
+    --resume_from_checkpoint "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/checkpoint/DOVE-s1-30steps/checkpoint-14000"  # if you want to resume from a checkpoint, otherwise, comment this line
 )
 
 # Validation Configuration
 VALIDATION_ARGS=(
     --do_validation true  # ["true", "false"]
-    --validation_dir "../datasets/test/UDM10"
+    --validation_dir "/data/42-julia-hpc-rz-cv/sig95vg/DOVE/datasets/test/UDM10/"
     --validation_steps 500  # should be multiple of checkpointing_steps
     --validation_videos "LQ-Video.txt"
     --validation_ref_videos "GT-Video.txt"
     # --validation_prompts "prompts.txt"
     --gen_fps 8
     --raw_test true
-    --num_inference_steps 1
+    --num_inference_steps 30
     --eval_metric_list "psnr,ssim,lpips,dists,clipiqa"  # ["psnr", "ssim", "lpips", "dists", "clipiqa", "musiq", "maniqa", 'niqe']
 )
 
@@ -78,9 +78,7 @@ SR_ARGS=(
     --is_cache true
     --empty_prompt true
     --prompt_cache "prompt_embeddings"
-    --sr_noise_step 399
-    --noise_step 0
-    --degradation_config "configs/degradation.yaml"
+    --degradation_config "/home/sig95vg/codes/DOVE/finetune/configs/degradation.yaml"
 )
 
 # Combine all arguments and launch training

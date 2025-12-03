@@ -396,8 +396,7 @@ def process_video(
     pipe: CogVideoXPipeline,
     video: torch.Tensor,
     prompt: str = '',
-    noise_step: int = 0,
-    sr_noise_step: int = 399,
+    num_inference_steps: int = 30,
     empty_prompt_embedding: torch.Tensor = None,
 ):
     # SR the video frames based on the prompt.
@@ -443,61 +442,69 @@ def process_video(
         _, seq_len, _ = prompt_embedding.shape
         prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
 
-    latent = latent.permute(0, 2, 1, 3, 4)
+    conditioning_latent = latent.permute(0, 2, 1, 3, 4).contiguous()
 
-    # Add noise to latent (Select)
-    if noise_step != 0:
-        noise = torch.randn_like(latent)
-        add_timesteps = torch.full(
-            (batch_size,),
-            fill_value=noise_step,
-            dtype=torch.long,
-            device=latent.device,
-        )
-        latent = pipe.scheduler.add_noise(latent, noise, add_timesteps)
-    
-    timesteps = torch.full(
-        (batch_size,),
-        fill_value=sr_noise_step,
-        dtype=torch.long,
-        device=latent.device,
-    )
+    scheduler = pipe.scheduler
+    scheduler.set_timesteps(num_inference_steps, device=conditioning_latent.device)
+    latents = torch.randn_like(conditioning_latent, dtype=torch.float32)
+    latents = latents.to(conditioning_latent.dtype) * scheduler.init_noise_sigma
 
-    # Prepare rotary embeds
     vae_scale_factor_spatial = 2 ** (len(pipe.vae.config.block_out_channels) - 1)
     transformer_config = pipe.transformer.config
     rotary_emb = (
         prepare_rotary_positional_embeddings(
-            height=height * vae_scale_factor_spatial,
-            width=width * vae_scale_factor_spatial,
-            num_frames=num_frames,
+            height=conditioning_latent.shape[3] * vae_scale_factor_spatial,
+            width=conditioning_latent.shape[4] * vae_scale_factor_spatial,
+            num_frames=conditioning_latent.shape[1],
             transformer_config=transformer_config,
             vae_scale_factor_spatial=vae_scale_factor_spatial,
-            device=latent.device,
+            device=conditioning_latent.device,
         )
         if pipe.transformer.config.use_rotary_positional_embeddings
         else None
     )
 
-    # Predict noise
-    predicted_noise = pipe.transformer(
-        hidden_states=latent,
-        encoder_hidden_states=prompt_embedding,
-        timestep=timesteps,
-        image_rotary_emb=rotary_emb,
-        return_dict=False,
-    )[0]
-    
-    latent_generate = pipe.scheduler.get_velocity(
-        predicted_noise, latent, timesteps
-    )
+    timesteps = scheduler.timesteps
+    old_pred_original_sample = None
+    for i, t in enumerate(timesteps):
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, device=conditioning_latent.device, dtype=timesteps.dtype)
+        t = t.to(conditioning_latent.device)
+        if t.ndim == 0:
+            t_batch = t.repeat(latents.shape[0])
+        elif t.ndim == 1 and t.shape[0] == 1:
+            t_batch = t.repeat(latents.shape[0])
+        elif t.ndim == 1 and t.shape[0] != latents.shape[0]:
+            t_batch = t.repeat(latents.shape[0])
+        else:
+            t_batch = t.view(-1)
+        scaled_latents = scheduler.scale_model_input(latents, t_batch)
+        model_input = scaled_latents + conditioning_latent
+        model_output = pipe.transformer(
+            hidden_states=model_input,
+            encoder_hidden_states=prompt_embedding,
+            timestep=t_batch,
+            image_rotary_emb=rotary_emb,
+            return_dict=False,
+        )[0]
+        model_output = model_output[:, :conditioning_latent.shape[1], :, :, :]
+        timestep_back = timesteps[i - 1].to(conditioning_latent.device) if i > 0 else None
+        latents, old_pred_original_sample = scheduler.step(
+            model_output,
+            old_pred_original_sample,
+            t,
+            timestep_back,
+            latents,
+            eta=0.0,
+            return_dict=False,
+        )
 
-    # generate video
     if patch_size_t is not None and ncopy > 0:
-        latent_generate = latent_generate[:, ncopy:, :, :, :]
+        latents = latents[:, ncopy:, :, :, :]
+    latents = latents.permute(0, 2, 1, 3, 4)
 
     # [B, C, F, H, W]
-    video_generate = pipe.decode_latents(latent_generate)
+    video_generate = pipe.decode_latents(latents)
     video_generate = (video_generate * 0.5 + 0.5).clamp(0.0, 1.0)
     
     return video_generate
@@ -530,9 +537,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--upscale", type=int, default=4)
 
-    parser.add_argument("--noise_step", type=int, default=0)
-
-    parser.add_argument("--sr_noise_step", type=int, default=399)
+    parser.add_argument("--num_inference_steps", type=int, default=30)
 
     parser.add_argument("--is_cpu_offload", action="store_true", help="Enable CPU offload for the model")
 
@@ -697,8 +702,7 @@ if __name__ == "__main__":
                         pipe=pipe,
                         video=video_chunk,
                         prompt=prompt,
-                        noise_step=args.noise_step,
-                        sr_noise_step=args.sr_noise_step,
+                        num_inference_steps=args.num_inference_steps,
                         empty_prompt_embedding=empty_prompt_embedding,
                     )
 

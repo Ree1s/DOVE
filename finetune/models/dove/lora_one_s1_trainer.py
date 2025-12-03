@@ -131,16 +131,15 @@ class DOVES1Trainer(Trainer):
         # Shape of latent: [B, C, F, H, W]
 
         patch_size_t = self.state.transformer_config.patch_size_t
+        pad_frames = 0
         if patch_size_t is not None:
-            ncopy = lq_latent.shape[2] % patch_size_t
-            # Copy the first frame ncopy times to match patch_size_t
-            lq_first_frame = lq_latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
-            lq_latent = torch.cat([lq_first_frame.repeat(1, 1, ncopy, 1, 1), lq_latent], dim=2)
-
-            hq_first_frame = hq_latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
-            hq_latent = torch.cat([hq_first_frame.repeat(1, 1, ncopy, 1, 1), hq_latent], dim=2)
-
-            assert lq_latent.shape[2] % patch_size_t == 0 and hq_latent.shape[2] % patch_size_t == 0
+            remainder = lq_latent.shape[2] % patch_size_t
+            pad_frames = (patch_size_t - remainder) % patch_size_t
+            if pad_frames > 0:
+                lq_first_frame = lq_latent[:, :, :1, :, :]
+                hq_first_frame = hq_latent[:, :, :1, :, :]
+                lq_latent = torch.cat([lq_first_frame.repeat(1, 1, pad_frames, 1, 1), lq_latent], dim=2)
+                hq_latent = torch.cat([hq_first_frame.repeat(1, 1, pad_frames, 1, 1), hq_latent], dim=2)
 
         batch_size, num_channels, num_frames, height, width = lq_latent.shape
 
@@ -148,37 +147,31 @@ class DOVES1Trainer(Trainer):
         _, seq_len, _ = prompt_embedding.shape
         prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=lq_latent.dtype)
 
-        lq_latent = lq_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
-        reshape_hq_latent = hq_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
+        lq_latent = lq_latent.permute(0, 2, 1, 3, 4).contiguous()  # [B, C, F, H, W] -> [B, F, C, H, W]
+        hq_latent = hq_latent.permute(0, 2, 1, 3, 4).contiguous()
 
-        # Noise Step (Select)
-        if self.args.noise_step != 0:
-            add_timesteps = torch.full(
-                (batch_size,),
-                fill_value=self.args.noise_step,
-                dtype=torch.long,
-                device=self.accelerator.device,
-            )
-
-            # Add noise to latent
-            noise = torch.randn_like(lq_latent)
-            lq_latent = self.components.scheduler.add_noise(lq_latent, noise, add_timesteps)
-        
-        timesteps = torch.full(
+        device = self.accelerator.device
+        timesteps = torch.randint(
+            0,
+            self.components.scheduler.config.num_train_timesteps,
             (batch_size,),
-            fill_value=self.args.sr_noise_step,
+            device=device,
             dtype=torch.long,
-            device=self.accelerator.device,
         )
+        noise = torch.randn_like(hq_latent, dtype=torch.float32)
+        noise = noise.to(hq_latent.dtype)
+        noisy_latent = self.components.scheduler.add_noise(hq_latent, noise, timesteps)
+        scaled_latent = self.components.scheduler.scale_model_input(noisy_latent, timesteps)
+        model_input = scaled_latent + lq_latent
 
         # Prepare rotary embeds
         vae_scale_factor_spatial = 2 ** (len(self.components.vae.config.block_out_channels) - 1)
         transformer_config = self.state.transformer_config
         rotary_emb = (
             self.prepare_rotary_positional_embeddings(
-                height=height * vae_scale_factor_spatial,
-                width=width * vae_scale_factor_spatial,
-                num_frames=num_frames,
+                height=model_input.shape[3] * vae_scale_factor_spatial,
+                width=model_input.shape[4] * vae_scale_factor_spatial,
+                num_frames=model_input.shape[1],
                 transformer_config=transformer_config,
                 vae_scale_factor_spatial=vae_scale_factor_spatial,
                 device=self.accelerator.device,
@@ -187,24 +180,23 @@ class DOVES1Trainer(Trainer):
             else None
         )
 
-        # Predict noise (actual is velocity)
         predicted_noise = self.components.transformer(
-            hidden_states=lq_latent,
+            hidden_states=model_input,
             encoder_hidden_states=prompt_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
             return_dict=False,
         )[0]
-        
-        # Denoise: x0 (x0' = αt x_t - σt * vθ(z_t))
-        latent_pred = self.components.scheduler.get_velocity(
-            predicted_noise, lq_latent, timesteps
-        )
-        # get_velocity (function): velocity = sqrt_alpha_prod * input2 - sqrt_one_minus_alpha_prod * input1
-        # get_velocity (here): latent_pred = sqrt_alpha_prod * lq_latent - sqrt_one_minus_alpha_prod * predicted_noise
 
-        # Calculate loss (MSE)
-        loss = F.mse_loss(latent_pred.float(), reshape_hq_latent.float(), reduction="mean")
+        prediction_type = getattr(self.components.scheduler.config, "prediction_type", "epsilon")
+        if prediction_type == "epsilon":
+            target = noise
+        elif prediction_type == "sample":
+            target = hq_latent
+        else:
+            target = self.components.scheduler.get_velocity(hq_latent, noise, timesteps)
+
+        loss = F.mse_loss(predicted_noise.float(), target.float(), reduction="mean")
 
         return loss
 
@@ -230,82 +222,86 @@ class DOVES1Trainer(Trainer):
         video = video.permute(0, 2, 1, 3, 4).contiguous()
 
         with torch.no_grad():
-            self.components.vae.to(self.accelerator.device)
-            latent = self.encode_video(video)
+            device = self.accelerator.device
+            scheduler = self.components.scheduler
+
+            self.components.vae.to(device)
+            latent_lq = self.encode_video(video)
 
             patch_size_t = self.state.transformer_config.patch_size_t
+            pad_frames = 0
             if patch_size_t is not None:
-                ncopy = latent.shape[2] % patch_size_t
-                # Copy the first frame ncopy times to match patch_size_t
-                first_frame = latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
-                latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
+                remainder = latent_lq.shape[2] % patch_size_t
+                pad_frames = (patch_size_t - remainder) % patch_size_t
+                if pad_frames > 0:
+                    first_frame = latent_lq[:, :, :1, :, :]
+                    latent_lq = torch.cat([first_frame.repeat(1, 1, pad_frames, 1, 1), latent_lq], dim=2)
 
-                assert latent.shape[2] % patch_size_t == 0
+            batch_size, _, num_frames, height, width = latent_lq.shape
 
-            batch_size, num_channels, num_frames, height, width = latent.shape
-
-            # Get prompt embeddings
-            self.components.text_encoder.to(self.accelerator.device)
+            self.components.text_encoder.to(device)
             prompt_embedding = self.encode_text(prompt)
             _, seq_len, _ = prompt_embedding.shape
-            prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
+            prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent_lq.dtype)
 
-            latent = latent.permute(0, 2, 1, 3, 4)
+            conditioning_latent = latent_lq.permute(0, 2, 1, 3, 4).contiguous()
 
-            # Add noise to latent (Select)
-            if self.args.noise_step != 0:
-                noise = torch.randn_like(latent)
-                add_timesteps = torch.full(
-                    (batch_size,),
-                    fill_value=self.args.noise_step,
-                    dtype=torch.long,
-                    device=self.accelerator.device,
-                )
-                latent = self.components.scheduler.add_noise(latent, noise, add_timesteps)
+            scheduler.set_timesteps(self.args.num_inference_steps, device=device)
+            latents = torch.randn_like(conditioning_latent, dtype=torch.float32)
+            latents = latents.to(conditioning_latent.dtype) * scheduler.init_noise_sigma
 
-            timesteps = torch.full(
-                (batch_size,),
-                fill_value=self.args.sr_noise_step,
-                dtype=torch.long,
-                device=self.accelerator.device,
-            )
-
-            # Prepare rotary embeds
             vae_scale_factor_spatial = 2 ** (len(self.components.vae.config.block_out_channels) - 1)
             transformer_config = self.state.transformer_config
             rotary_emb = (
                 self.prepare_rotary_positional_embeddings(
-                    height=height * vae_scale_factor_spatial,
-                    width=width * vae_scale_factor_spatial,
-                    num_frames=num_frames,
+                    height=conditioning_latent.shape[3] * vae_scale_factor_spatial,
+                    width=conditioning_latent.shape[4] * vae_scale_factor_spatial,
+                    num_frames=conditioning_latent.shape[1],
                     transformer_config=transformer_config,
                     vae_scale_factor_spatial=vae_scale_factor_spatial,
-                    device=self.accelerator.device,
+                    device=device,
                 )
                 if transformer_config.use_rotary_positional_embeddings
                 else None
             )
 
-            # Predict noise (actual is velocity)
-            predicted_noise = self.components.transformer(
-                hidden_states=latent,
-                encoder_hidden_states=prompt_embedding,
-                timestep=timesteps,
-                image_rotary_emb=rotary_emb,
-                return_dict=False,
-            )[0]
-            
-            # Denoise: x0 (x0' = αt x_t - σt * vθ(z_t))
-            latent_generate = self.components.scheduler.get_velocity(
-                predicted_noise, latent, timesteps
-            )
-            # get_velocity (function): velocity = sqrt_alpha_prod * input2 - sqrt_one_minus_alpha_prod * input1
-            # get_velocity (here): latent_pred = sqrt_alpha_prod * latent - sqrt_one_minus_alpha_prod * predicted_noise
+            timesteps = scheduler.timesteps
+            old_pred_original_sample = None
+            for i, t in enumerate(timesteps):
+                if not torch.is_tensor(t):
+                    t = torch.tensor(t, device=device, dtype=timesteps.dtype)
+                t = t.to(device)
+                if t.ndim == 0:
+                    t_batch = t.repeat(latents.shape[0])
+                elif t.ndim == 1 and t.shape[0] == 1:
+                    t_batch = t.repeat(latents.shape[0])
+                elif t.ndim == 1 and t.shape[0] != latents.shape[0]:
+                    t_batch = t.repeat(latents.shape[0])
+                else:
+                    t_batch = t.view(-1)
+                scaled_latents = scheduler.scale_model_input(latents, t_batch)
+                model_input = scaled_latents + conditioning_latent
+                model_output = self.components.transformer(
+                    hidden_states=model_input,
+                    encoder_hidden_states=prompt_embedding,
+                    timestep=t_batch,
+                    image_rotary_emb=rotary_emb,
+                    return_dict=False,
+                )[0]
+                timestep_back = timesteps[i - 1].to(device) if i > 0 else None
+                latents, old_pred_original_sample = scheduler.step(
+                    model_output,
+                    old_pred_original_sample,
+                    t,
+                    timestep_back,
+                    latents,
+                    eta=0.0,
+                    return_dict=False,
+                )
 
-            # generate video
-            if patch_size_t is not None and ncopy > 0:
-                latent_generate = latent_generate[:, ncopy:, :, :, :]
-            video = pipe.decode_latents(latent_generate)
+            if pad_frames > 0:
+                latents = latents[:, pad_frames:, :, :, :]
+            video = pipe.decode_latents(latents)
 
             # # output video as PIL list
             # video = pipe.video_processor.postprocess_video(video=video, output_type='pil')
