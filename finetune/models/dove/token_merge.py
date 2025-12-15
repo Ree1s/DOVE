@@ -286,6 +286,7 @@ class RouteInfo:
     src_tokens: torch.Tensor
     src_idx: List[torch.Tensor]
     keep_idx: List[torch.Tensor]
+    best_dst_indices: Optional[torch.Tensor]
     pos_index: Optional[torch.Tensor]
     orig_shape: Tuple[int, int, int]
     text_length: int
@@ -340,11 +341,16 @@ class Router:
         text_length: int = 0,
         num_frames: int = 0,
         importance_map: Optional[torch.Tensor] = None,
+        use_psg_importance: bool = False,
     ) -> Tuple[torch.Tensor, RouteInfo]:
         if text_length > 0:
             text_tokens, image_tokens = tokens[:, :text_length], tokens[:, text_length:]
         else:
             text_tokens, image_tokens = None, tokens
+
+        if use_psg_importance and importance_map is None and num_frames > 1:
+            if image_tokens.shape[1] % max(num_frames, 1) == 0:
+                importance_map = compute_psg_temporal_importance(image_tokens, num_frames)
 
         generator = torch.Generator(device=tokens.device)
         generator.manual_seed(self.seed)
@@ -411,6 +417,7 @@ class Router:
             src_tokens=src_copy,
             src_idx=info["all_src_idx"],
             keep_idx=keep_idx,
+            best_dst_indices=info.get("best_dst_indices", None),
             pos_index=pos_index,
             orig_shape=image_tokens.shape,
             text_length=text_length,
@@ -473,7 +480,78 @@ __all__ = [
     "RestoreAdapter",
     "bipartite_soft_matching_randframe",
     "bipartite_soft_matching_rand2d",
+    "compute_psg_temporal_importance",
 ]
+
+
+def compute_psg_temporal_importance(
+    image_tokens: torch.Tensor,
+    num_frames: int,
+    eps: float = 1e-8,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Compute a PSG-style temporal curvature importance map for image tokens.
+
+    Args:
+        image_tokens: [B, N_img, C], where N_img = num_frames * tokens_per_frame.
+        num_frames:   Number of frames (F).
+        eps:          Small constant for numerical stability.
+        normalize:    If True, normalize importance to [0, 1] per batch.
+
+    Returns:
+        importance_map: [B, N_img]
+    """
+    B, N_img, C = image_tokens.shape
+    device = image_tokens.device
+
+    if num_frames <= 0 or N_img == 0:
+        return image_tokens.new_ones(B, N_img, device=device)
+
+    if N_img % num_frames != 0:
+        return image_tokens.new_ones(B, N_img, device=device)
+
+    tokens_per_frame = N_img // num_frames
+    x = image_tokens.reshape(B, num_frames, tokens_per_frame, C)
+
+    if num_frames == 1:
+        return image_tokens.new_ones(B, N_img, device=device)
+
+    v = x[:, 1:, :, :] - x[:, :-1, :, :]  # [B, F-1, P, C]
+
+    if num_frames == 2:
+        v_mag = v.norm(dim=-1)  # [B, 1, P]
+        importance = v_mag.expand(B, num_frames, tokens_per_frame)
+        if normalize:
+            flat = importance.reshape(B, -1)
+            min_vals = flat.min(dim=1, keepdim=True)[0].view(B, 1, 1)
+            max_vals = flat.max(dim=1, keepdim=True)[0].view(B, 1, 1)
+            importance = (importance - min_vals) / (max_vals - min_vals + eps)
+        return importance.reshape(B, N_img)
+
+    v1 = v[:, :-1, :, :]
+    v2 = v[:, 1:, :, :]
+
+    dot = (v1 * v2).sum(dim=-1)
+    n1 = v1.norm(dim=-1)
+    n2 = v2.norm(dim=-1)
+
+    cos = dot / (n1 * n2 + eps)
+    cos = cos.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    curvature = torch.arccos(cos)  # [B, F-2, P]
+
+    importance = image_tokens.new_zeros((B, num_frames, tokens_per_frame), device=device)
+    importance[:, 1:-1, :] = curvature
+    importance[:, 0, :] = curvature[:, 0, :]
+    importance[:, -1, :] = curvature[:, -1, :]
+
+    if normalize:
+        flat = importance.reshape(B, -1)
+        min_vals = flat.min(dim=1, keepdim=True)[0].view(B, 1, 1)
+        max_vals = flat.max(dim=1, keepdim=True)[0].view(B, 1, 1)
+        importance = (importance - min_vals) / (max_vals - min_vals + eps)
+
+    return importance.reshape(B, N_img)
 
 
 def parse_token_merge_routes(spec: Optional[str]) -> List[Dict[str, float]]:
